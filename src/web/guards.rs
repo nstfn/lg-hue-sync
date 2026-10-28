@@ -147,7 +147,8 @@ fn split_authority(authority: &str) -> Option<(HostName, Option<u16>)> {
             if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
                 return None;
             }
-            Some(digits.parse::<u16>().ok()?)
+            let port = digits.parse::<u16>().ok()?;
+            Some(port)
         }
     };
     Some((name, port))

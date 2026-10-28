@@ -150,7 +150,7 @@ pub fn capture_session_wait(
     min: Duration,
 ) -> Option<Duration> {
     let elapsed = now.saturating_duration_since(last?);
-    (elapsed < min).then(|| min - elapsed)
+    min.checked_sub(elapsed).filter(|wait| !wait.is_zero())
 }
 
 /// Claims the next native session slot. A refused claim is an init failure: the caller keeps

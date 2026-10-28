@@ -750,6 +750,7 @@ fn build_router(state: AppState) -> anyhow::Result<Router> {
     document.info.version = env!("CARGO_PKG_VERSION").to_string();
     document.info.description = Some("LAN API without authentication. Control acknowledgements do not prove physical light output. JSON extractors can return plain-text errors (400 malformed JSON, 413 oversized body, 415 missing JSON content type, 422 invalid fields). Pairing and area selection persist configuration before requesting controller reconfiguration; a later controller failure does not roll back that save.".to_string());
     let specification = axum::body::Bytes::from(document.to_json()?);
+    // The last layer runs first: a foreign Host or Origin is refused before it takes a slot.
     Ok(router
         .route("/", get(root))
         .route("/index.html", get(root))
@@ -768,7 +769,6 @@ fn build_router(state: AppState) -> anyhow::Result<Router> {
             RequestLimits::default(),
             guards::limit_requests,
         ))
-        // Outermost: refuse a foreign Host or Origin before it takes a request slot.
         .layer(axum::middleware::from_fn(guards::check_host_origin))
         .with_state(state))
 }
@@ -1193,7 +1193,6 @@ fn claim_api_config_write(
         );
         ApiError::TooManyRequests(message)
     })
-}
 }
 
 /// Queue pipeline restart.
