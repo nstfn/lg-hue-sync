@@ -377,7 +377,8 @@ mod tests {
         fn stream_stopped(&self) -> bool {
             assert_eq!(self.events, ["stop"], "polled before the stop request");
             self.polls.set(self.polls.get() + 1);
-            self.stops_after.is_some_and(|polls| self.polls.get() > polls)
+            self.stops_after
+                .is_some_and(|polls| self.polls.get() > polls)
         }
 
         fn lights_off(&mut self) {
