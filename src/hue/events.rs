@@ -111,6 +111,16 @@ fn bridge_key(config: &Config) -> BridgeKey {
     )
 }
 
+/// The startup sync's snapshot replaces the baseline once; another bridge or key never reuses
+/// a baseline.
+fn current_baseline(
+    baseline: Option<(BridgeKey, Value)>,
+    seed: Option<(BridgeKey, Value)>,
+    key: &BridgeKey,
+) -> Option<(BridgeKey, Value)> {
+    seed.or(baseline).filter(|(previous, _)| previous == key)
+}
+
 /// Another area, or changed channels or locations, needs a bridge sync; a subscription that
 /// only renews (after a dashboard action, for example) does not.
 fn topology_differs(previous: Option<&Value>, current: &Value) -> bool {
@@ -150,6 +160,7 @@ pub struct HueEvents {
     generation: Arc<AtomicU64>,
     latest: Latest,
     socket: Arc<Mutex<Option<TcpStream>>>,
+    seed: Arc<Mutex<Option<(BridgeKey, Value)>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -165,6 +176,8 @@ impl HueEvents {
         let current = generation.clone();
         let output = latest.clone();
         let active_socket = socket.clone();
+        let seed = Arc::new(Mutex::new(None::<(BridgeKey, Value)>));
+        let startup_seed = seed.clone();
         let worker = thread::Builder::new()
             .name("hue-events".into())
             .spawn(move || {
@@ -179,12 +192,8 @@ impl HueEvents {
                     let (epoch, config) = command;
                     let Some(config) = config else { continue };
                     let key = bridge_key(&config);
-                    if baseline
-                        .as_ref()
-                        .is_some_and(|(previous, _)| *previous != key)
-                    {
-                        baseline = None;
-                    }
+                    let seeded = startup_seed.lock().unwrap().take();
+                    baseline = current_baseline(baseline, seeded, &key);
                     let mut previous_configuration: Option<Value> = None;
                     let mut retry_delay = Duration::from_secs(2);
                     while current.load(Ordering::SeqCst) == epoch {
@@ -261,8 +270,15 @@ impl HueEvents {
             generation,
             latest,
             socket,
+            seed,
             worker: Some(worker),
         })
+    }
+
+    /// Seeds the first subscription's baseline with the startup sync's configuration, so an
+    /// unchanged area needs no second sync and no second stream session.
+    pub fn seed_baseline(&self, config: &Config, configuration: Value) {
+        *self.seed.lock().unwrap() = Some((bridge_key(config), configuration));
     }
 
     pub fn request(&mut self, config: Option<&Config>) {
@@ -651,6 +667,65 @@ mod tests {
             changed[key] = value;
             assert!(topology_differs(Some(&snapshot), &changed), "{key}");
         }
+    }
+
+    #[test]
+    fn startup_sync_seeds_the_baseline_of_the_same_bridge_only() {
+        let key = |ip: &str| bridge_key(&Config::new_default(ip, "user", "", "area"));
+        let startup = json!({"id": "area", "channels": [{"channel_id": 0}]});
+        let earlier = json!({"id": "area", "channels": []});
+        let seed = Some((key("192.0.2.1"), startup.clone()));
+        let baseline = current_baseline(None, seed.clone(), &key("192.0.2.1"));
+        assert_eq!(baseline.map(|(_, value)| value), Some(startup.clone()));
+        let renewed = current_baseline(
+            Some((key("192.0.2.1"), earlier)),
+            seed.clone(),
+            &key("192.0.2.1"),
+        );
+        assert_eq!(renewed.map(|(_, value)| value), Some(startup));
+        assert!(current_baseline(None, seed, &key("192.0.2.2")).is_none());
+        assert!(current_baseline(None, None, &key("192.0.2.1")).is_none());
+    }
+
+    #[test]
+    fn seeded_first_snapshot_syncs_only_when_the_topology_changed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut open = Vec::new();
+            for mut stream in listener.incoming().flatten() {
+                let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+                let _ = std::io::Write::write_all(&mut stream, header);
+                open.push(stream);
+            }
+        });
+        let startup = json!({"id": "area", "status": "inactive", "channels": []});
+        let first = |snapshot: Value, seed: Value| {
+            let mut worker = HueEvents::new(
+                move |_| Ok(snapshot.clone()),
+                move |_| {
+                    let stream = TcpStream::connect(address)?;
+                    let cancellation = stream.try_clone()?;
+                    Ok(EventConnection::new(Box::new(stream), cancellation))
+                },
+            )
+            .unwrap();
+            let bridge = Config::new_default("192.0.2.1", "user", "", "area");
+            worker.seed_baseline(&bridge, seed);
+            worker.request(Some(&bridge));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(state) = worker.poll() {
+                    break state.unwrap().topology_changed;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        assert!(!first(startup.clone(), startup.clone()), "unchanged area");
+        let mut changed = startup.clone();
+        changed["channels"] = json!([{"channel_id": 0}]);
+        assert!(first(changed, startup), "a change after the startup sync");
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct EntertainmentArea {
     pub zones: Vec<crate::config::LightZone>,
     pub certificate_sha256: String,
     pub bridge_id: String,
+    /// The selected configuration resource as the bridge returned it.
+    pub configuration: Value,
 }
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -168,6 +170,7 @@ pub fn sync_entertainment_areas(
         zones: discovered_zones,
         certificate_sha256,
         bridge_id,
+        configuration: configuration.clone(),
     })
 }
 
@@ -230,7 +233,19 @@ fn v2_request(
     payload: Option<&Value>,
     trust: BridgeTrust<'_>,
 ) -> Result<(Value, String)> {
-    let response = raw_request(bridge_ip, username, method, path, payload, trust)?;
+    v2_request_until(bridge_ip, username, method, path, payload, trust, None)
+}
+
+fn v2_request_until(
+    bridge_ip: &str,
+    username: &str,
+    method: &str,
+    path: &str,
+    payload: Option<&Value>,
+    trust: BridgeTrust<'_>,
+    deadline: Option<Instant>,
+) -> Result<(Value, String)> {
+    let response = raw_request_until(bridge_ip, username, method, path, payload, trust, deadline)?;
     let json: Value = serde_json::from_slice(&response.body)?;
     if json
         .get("errors")
@@ -257,6 +272,19 @@ fn raw_request(
     payload: Option<&Value>,
     trust: BridgeTrust<'_>,
 ) -> Result<HttpResponse> {
+    raw_request_until(bridge_ip, username, method, path, payload, trust, None)
+}
+
+/// Without a deadline, the request gets 15 s after the TLS connection.
+fn raw_request_until(
+    bridge_ip: &str,
+    username: &str,
+    method: &str,
+    path: &str,
+    payload: Option<&Value>,
+    trust: BridgeTrust<'_>,
+    deadline: Option<Instant>,
+) -> Result<HttpResponse> {
     if !username.is_empty() && !trust.known() {
         return Err(anyhow!(
             "Hue Bridge has no saved identity; pair it explicitly before sending credentials"
@@ -272,7 +300,10 @@ fn raw_request(
     let mut stream = connect_bridge_tls(bridge_ip, trust)?;
     let certificate_sha256 = tls::peer_certificate_sha256(&stream)?;
     let bridge_id = peer_bridge_id(&stream)?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(15));
+    if Instant::now() >= deadline {
+        return Err(anyhow!("Hue Bridge request deadline passed"));
+    }
     let _deadline_guard = SocketDeadline::new(stream.get_ref(), deadline)?;
     let body = payload.map(serde_json::to_vec).transpose()?;
     write!(
@@ -862,6 +893,71 @@ pub fn get_stream_state(
     parse_stream_state(&configuration, &application_id)
 }
 
+/// CLIP v2 light paths of the lights the configuration lists, once no application streams to
+/// it: our stream must have stopped, and another application's output is never touched.
+pub fn light_off_paths(configuration: &Value, application_id: &str) -> Result<Vec<String>> {
+    let state = parse_stream_state(configuration, application_id)?;
+    if state.busy {
+        return Err(anyhow!(
+            "Hue Entertainment area is in use by another application"
+        ));
+    }
+    if state.active {
+        return Err(anyhow!("Hue Entertainment stream has not stopped"));
+    }
+    let services = configuration
+        .get("light_services")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // Light IDs are UUIDs, like configuration IDs; nothing else reaches the request path.
+    let mut paths = services
+        .iter()
+        .filter(|service| service.get("rtype").and_then(Value::as_str) == Some("light"))
+        .filter_map(|service| service.get("rid").and_then(Value::as_str))
+        .filter(|id| valid_configuration_id(id))
+        .map(|id| format!("/clip/v2/resource/light/{}", id.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Turns off the configuration's lights after our stream stopped. No request starts or sends
+/// after `deadline`. Returns the lights turned off and the lights listed.
+pub fn turn_off_entertainment_lights(
+    bridge_ip: &str,
+    username: &str,
+    configuration_id: &str,
+    application_id: Option<&str>,
+    trust: BridgeTrust<'_>,
+    deadline: Instant,
+) -> Result<(usize, usize)> {
+    let application_id = match application_id {
+        Some(id) => id.to_owned(),
+        None => fetch_application_id(bridge_ip, username, trust)?,
+    };
+    let configuration = fetch_stream_configuration(bridge_ip, username, configuration_id, trust)?;
+    let paths = light_off_paths(&configuration, &application_id)?;
+    let until = Some(deadline);
+    // One connection per light, in parallel, so the deadline covers the whole area.
+    let turned_off = thread::scope(|scope| {
+        let mut requests = Vec::with_capacity(paths.len());
+        for path in &paths {
+            requests.push(scope.spawn(move || {
+                let off = serde_json::json!({ "on": { "on": false } });
+                v2_request_until(bridge_ip, username, "PUT", path, Some(&off), trust, until)
+            }));
+        }
+        requests
+            .into_iter()
+            .map(|request| request.join())
+            .filter(|result| matches!(result, Ok(Ok(_))))
+            .count()
+    });
+    Ok((turned_off, paths.len()))
+}
+
 #[allow(dead_code)]
 pub fn get_stream_status(
     bridge_ip: &str,
@@ -903,6 +999,42 @@ mod tests {
         assert!(!valid_configuration_id(
             "1234567811234-1234-1234-123456789abc"
         ));
+    }
+
+    #[test]
+    fn light_off_requests_come_from_the_configuration_light_services() {
+        let app = "12345678-1234-1234-1234-123456789abc";
+        let other = "12345678-1234-1234-1234-123456789abd";
+        let light = "aaaaaaaa-1234-1234-1234-123456789abc";
+        let strip = "BBBBBBBB-1234-1234-1234-123456789ABC";
+        let mut configuration = serde_json::json!({
+            "id": "12345678-0000-0000-0000-123456789abc",
+            "type": "entertainment_configuration",
+            "status": "inactive",
+            "light_services": [
+                {"rid": strip, "rtype": "light"},
+                {"rid": light, "rtype": "light"},
+                {"rid": light, "rtype": "light"},
+                {"rid": "../bridge", "rtype": "light"},
+                {"rid": other, "rtype": "entertainment"}
+            ]
+        });
+        let paths = light_off_paths(&configuration, app).unwrap();
+        let light_path = format!("/clip/v2/resource/light/{light}");
+        let strip_path = format!("/clip/v2/resource/light/{}", strip.to_ascii_lowercase());
+        assert_eq!(paths, [light_path, strip_path]);
+        // Another application streams: its output is never touched.
+        configuration["status"] = serde_json::json!("active");
+        configuration["active_streamer"] = serde_json::json!({"rtype": "auth_v1", "rid": other});
+        let error = light_off_paths(&configuration, app).unwrap_err();
+        assert!(error.to_string().contains("another application"));
+        // Our own stream must stop first, or the bridge would override the lights.
+        configuration["active_streamer"]["rid"] = serde_json::json!(app);
+        assert!(light_off_paths(&configuration, app).is_err());
+        configuration["status"] = serde_json::json!("inactive");
+        configuration.as_object_mut().unwrap().remove("light_services");
+        assert!(light_off_paths(&configuration, app).unwrap().is_empty());
+        assert!(light_off_paths(&serde_json::json!({}), app).is_err());
     }
 
     #[test]

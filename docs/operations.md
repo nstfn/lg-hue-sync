@@ -92,6 +92,20 @@ zero → `running`/hardware true/60 FPS, with its error cleared automatically.
 Local/remote binary SHA-256 matched and the paired configuration checksum stayed
 unchanged. Source-policy tests cover manual Stop surviving source changes.
 
+## Lights when the TV turns off
+
+`tv_off_lights` in `config.json` sets what the Hue lights do when the TV goes
+to standby or the system shuts down while this daemon streams. With `"off"`
+(the default), the daemon stops its Entertainment stream, then turns off each
+light the Entertainment configuration lists (CLIP v2 `light_services`), within
+2 s. With `"restore"`, the bridge restores the lights to their state from
+before streaming. The daemon never touches the lights while another application
+streams or while Hue sync is off. A SIGTERM turns the lights off only when
+`systemctl is-system-running` reports `stopping`, or, if that check fails within
+1 s, when the TV was last seen in standby. A `systemctl restart` or a binary
+update with the TV on leaves the lights unchanged. When the TV wakes, the stream
+starts again and drives the lights.
+
 ## Codex project setup
 
 Codex loads [`.codex/environments/environment.toml`](../.codex/environments/environment.toml) from this repository. It sets up new worktrees with `make setup` and adds actions to update dependencies, refresh Rust stable, validate/build, transfer to the TV, and clean Docker builds. Leave automatic worktree cleanup empty so reusable Docker caches survive.

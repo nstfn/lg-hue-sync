@@ -151,6 +151,17 @@ pub enum NanoleafStartCorner {
     BottomRight,
 }
 
+/// What the Hue lights do when the TV powers off or goes to standby while this daemon streams.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TvOffLights {
+    /// Turn the Entertainment area's lights off once our stream has stopped.
+    #[default]
+    Off,
+    /// Leave the lights as the bridge restores them after streaming.
+    Restore,
+}
+
 fn default_nanoleaf_port() -> u16 {
     60222
 }
@@ -189,6 +200,9 @@ pub struct Config {
     /// Automatically pause/resume outputs with the TV's active/standby state.
     #[serde(default = "default_true")]
     pub auto_tv_power: bool,
+    /// Hue lights after a TV standby or a system shutdown that stops our stream.
+    #[serde(default)]
+    pub tv_off_lights: TvOffLights,
     #[serde(default = "default_true")]
     pub hue_enabled: bool,
     /// Runtime preference: keep Hue configured but release its entertainment area when off.
@@ -428,6 +442,7 @@ impl Config {
             preset_overrides: BTreeMap::new(),
             bonjour_enabled: false,
             auto_tv_power: true,
+            tv_off_lights: TvOffLights::default(),
             hue_enabled: true,
             hue_sync_enabled: true,
             bridge_ip: bridge_ip.to_string(),
@@ -614,6 +629,20 @@ fn lock_config(path: &Path) -> Result<File, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tv_off_lights_defaults_to_off_and_accepts_restore() {
+        let mut value = serde_json::to_value(Config::new_default("", "", "", "")).unwrap();
+        assert_eq!(value["tv_off_lights"], "off");
+        value.as_object_mut().unwrap().remove("tv_off_lights");
+        let config: Config = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.tv_off_lights, TvOffLights::Off);
+        value["tv_off_lights"] = serde_json::json!("restore");
+        let config: Config = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.tv_off_lights, TvOffLights::Restore);
+        value["tv_off_lights"] = serde_json::json!("dim");
+        assert!(serde_json::from_value::<Config>(value).is_err());
+    }
 
     #[test]
     fn legacy_configs_start_without_preset_overrides() {

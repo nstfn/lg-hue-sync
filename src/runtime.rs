@@ -1,9 +1,12 @@
+use crate::config::TvOffLights;
 use crate::web::ControlCommand;
 use crate::web::LiveSettings;
-use std::time::Duration;
+use std::{process::Stdio, time::Duration};
 use tokio::{
+    io::AsyncReadExt,
+    process::Command,
     sync::{mpsc, oneshot},
-    time::Instant,
+    time::{timeout, Instant},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,9 +213,101 @@ pub fn bridge_sync_retry_due(needs_refresh: bool, hue_wanted: bool, retry: &Retr
     needs_refresh && hue_wanted && retry.ready()
 }
 
+/// Lights go off only when the TV is off, Hue sync is on and our application was the active
+/// streamer; `Restore` keeps the bridge's own post-stream restore.
+pub fn tv_off_lights_due(
+    mode: TvOffLights,
+    hue_sync_enabled: bool,
+    our_stream: bool,
+    tv_off: bool,
+) -> bool {
+    mode == TvOffLights::Off && hue_sync_enabled && our_stream && tv_off
+}
+
+/// systemd reports "stopping" only while the whole system shuts down; a service restart or a
+/// binary upgrade leaves it "running" or "degraded". Without a state, only a TV already seen in
+/// standby counts as off, so a restart of an active TV never turns the lights off.
+pub fn sigterm_is_shutdown(system_state: Option<&str>, tv_active: Option<bool>) -> bool {
+    match system_state.map(str::trim).unwrap_or_default() {
+        "" => tv_active == Some(false),
+        state => state == "stopping",
+    }
+}
+
+/// `systemctl is-system-running`, bounded like `luna::query`: a late child is killed and
+/// reaped. The exit status is ignored because every state but "running" exits non-zero.
+pub async fn system_state(program: &str, deadline: Duration) -> Option<String> {
+    const MAX_REPLY: u64 = 256;
+    let mut child = Command::new(program)
+        .kill_on_drop(true)
+        .arg("is-system-running")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let state = timeout(deadline, async {
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()?
+            .take(MAX_REPLY)
+            .read_to_end(&mut bytes)
+            .await
+            .ok()?;
+        child.wait().await.ok()?;
+        String::from_utf8(bytes)
+            .ok()
+            .map(|state| state.trim().to_owned())
+    })
+    .await
+    .ok()
+    .flatten();
+    if state.is_none() {
+        let _ = child.kill().await;
+    }
+    state
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_system_shutdown_or_a_known_standby_counts_as_tv_off_at_sigterm() {
+        assert!(sigterm_is_shutdown(Some("stopping"), Some(true)));
+        assert!(sigterm_is_shutdown(Some("stopping\n"), None));
+        // A restart or an upgrade while the TV is on keeps the lights.
+        for state in ["running", "degraded", "starting", "maintenance"] {
+            assert!(!sigterm_is_shutdown(Some(state), Some(true)), "{state}");
+            assert!(!sigterm_is_shutdown(Some(state), None), "{state}");
+            assert!(!sigterm_is_shutdown(Some(state), Some(false)), "{state}");
+        }
+        // A failed or timed-out check falls back to the last TV power state.
+        for state in [None, Some(""), Some(" \n")] {
+            assert!(sigterm_is_shutdown(state, Some(false)));
+            assert!(!sigterm_is_shutdown(state, Some(true)));
+            assert!(!sigterm_is_shutdown(state, None));
+        }
+    }
+
+    #[test]
+    fn tv_off_lights_are_skipped_on_restore_without_hue_sync_or_without_our_stream() {
+        assert!(tv_off_lights_due(TvOffLights::Off, true, true, true));
+        assert!(!tv_off_lights_due(TvOffLights::Restore, true, true, true));
+        assert!(!tv_off_lights_due(TvOffLights::Off, false, true, true));
+        // Another application streams, or we never streamed: the lights are not ours.
+        assert!(!tv_off_lights_due(TvOffLights::Off, true, false, true));
+        assert!(!tv_off_lights_due(TvOffLights::Off, true, true, false));
+    }
+
+    #[tokio::test]
+    async fn system_state_reads_the_reply_and_fails_closed() {
+        let echoed = system_state("echo", Duration::from_secs(5)).await;
+        assert_eq!(echoed.as_deref(), Some("is-system-running"));
+        let missing = system_state("lg-hue-sync-missing", Duration::from_secs(1)).await;
+        assert!(missing.is_none());
+    }
 
     #[tokio::test]
     async fn shutdown_interrupts_capture_recovery_before_driver_recreation() {

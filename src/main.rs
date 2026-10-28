@@ -409,6 +409,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         let _ = set_hue_stream_active(&config, false);
     }
 
+    let mut startup_snapshot = None;
     if hue_active {
         let bridge_identity = (
             config.bridge_ip.clone(),
@@ -428,6 +429,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 config.hue_bridge_id = Some(area.bridge_id.clone());
                 config.hue_bridge_certificate_sha256 = Some(area.certificate_sha256);
                 config.zones = area.zones;
+                startup_snapshot = Some(area.configuration);
                 if let Err(error) = Config::update(&config_path, None, |current| {
                     if (
                         current.bridge_ip.as_str(),
@@ -480,6 +482,9 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
     // Setup graceful shutdown handler for SIGINT and SIGTERM
     let running = Arc::new(AtomicBool::new(true));
+    // Only SIGTERM can mean a system shutdown; SIGINT and a reconfigure restart never do.
+    let sigterm = Arc::new(AtomicBool::new(false));
+    let received_sigterm = sigterm.clone();
     let shutdown = CancellationToken::new();
     let signal_shutdown = shutdown.clone();
     let r = running.clone();
@@ -506,11 +511,13 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     }
                 } => {
                     info!("Received SIGTERM from systemd. Stopping sync gracefully...");
+                    received_sigterm.store(true, Ordering::SeqCst);
                 }
             }
         }
         #[cfg(not(unix))]
         {
+            let _ = &received_sigterm;
             tokio::signal::ctrl_c().await.ok();
             info!("Received shutdown signal. Stopping sync...");
         }
@@ -525,9 +532,19 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut hue_reconnect =
         HueReconnect::new(reconnect_hue, |config| set_hue_stream_active(config, false))?;
     let mut hue_status = HueStatus::new()?;
-    // The first SSE snapshot triggers a layout refresh before Hue output starts.
-    hue_status.blocked = hue_active;
-    hue_status.needs_refresh = hue_active;
+    // The startup sync is the first SSE snapshot's baseline: an unchanged area starts Hue output
+    // at once, with one sync and one stream session. Without a startup sync, the first snapshot
+    // or the sync retry refreshes the layout before Hue output starts.
+    let startup_synced = startup_snapshot.is_some();
+    if let Some(snapshot) = startup_snapshot {
+        hue_status.events.seed_baseline(&config, snapshot);
+    }
+    hue_status.blocked = hue_active && !startup_synced;
+    hue_status.needs_refresh = hue_active && !startup_synced;
+    let tv_off_lights = config.tv_off_lights;
+    // Set at a TV standby that stops our stream; the lights go off once the stop has settled.
+    let mut tv_off_lights_pending: Option<tokio::time::Instant> = None;
+    let mut hue_application_id: Option<String> = None;
 
     let mut hue_sampler = if hue_active {
         Some(ZoneSampler::new(
@@ -788,6 +805,14 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             && !source_policy.manually_stopped()
                         {
                             pending_commands.desired_running = Some(active);
+                            if runtime::tv_off_lights_due(
+                                tv_off_lights,
+                                hue_active && hue_sync_enabled,
+                                hue_dtls.is_some() && !hue_status.blocked,
+                                !active,
+                            ) {
+                                tv_off_lights_pending = Some(tokio::time::Instant::now());
+                            }
                         }
                     }
                     observed_tv_power = Some(active);
@@ -816,6 +841,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             && !pending_commands.has_management_action()
         {
             if let Some(state) = poll_hue_status(&mut hue_status, &config, &mut pending_commands) {
+                hue_application_id = Some(state.application_id.clone());
                 if !state.active && hue_dtls.is_some() {
                     // Ownership loss suspends Hue only; Nanoleaf keeps its own session.
                     hue_status.blocked = true;
@@ -882,6 +908,18 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 pending_commands.receive(&mut command_rx);
                 source_policy.manual_request(pending_commands.manual_running.take());
                 watchdog.tick();
+                if let Some(since) = tv_off_lights_pending {
+                    // The bridge restores the lights when our stream stops, so they go off after.
+                    if !hue_sync_enabled {
+                        tv_off_lights_pending = None;
+                    } else if hue_reconnect.is_settled() {
+                        tv_off_lights_pending = None;
+                        turn_off_tv_lights(&config, hue_application_id.as_deref());
+                    } else if since.elapsed() >= Duration::from_secs(10) {
+                        tv_off_lights_pending = None;
+                        warn!("TV standby: Hue stream did not stop in 10 s; lights unchanged.");
+                    }
+                }
                 let external_before = ExternalState {
                     tv_active: observed_tv_power,
                     hdmi_source: source_policy.compatible(),
@@ -1000,6 +1038,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         && requested_running != Some(true))
                 {
                     source_policy.resumed();
+                    tv_off_lights_pending = None;
                     hue_status.request(None);
                     info!(
                         "Sync resume requested! Reactivating Hue & Nanoleaf streaming sessions..."
@@ -1831,10 +1870,40 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     shared_state.set_fps(0.0);
     shared_state.set_light_update_fps(0.0);
 
+    let tv_off_candidate = sigterm.load(Ordering::SeqCst)
+        && runtime::tv_off_lights_due(
+            tv_off_lights,
+            hue_active && hue_sync_enabled,
+            (hue_dtls.is_some() && !hue_status.blocked) || tv_off_lights_pending.is_some(),
+            true,
+        );
+    let lights_off = if tv_off_candidate {
+        let state = runtime::system_state("systemctl", Duration::from_secs(1)).await;
+        let off = tv_off_lights_pending.is_some()
+            || runtime::sigterm_is_shutdown(state.as_deref(), observed_tv_power);
+        info!(
+            "SIGTERM with system state '{}' and TV power {:?}: {}.",
+            state.as_deref().unwrap_or("unknown"),
+            observed_tv_power,
+            if off {
+                "TV off, Hue lights go off after the stream stops"
+            } else {
+                "service stop, Hue lights unchanged"
+            }
+        );
+        off
+    } else {
+        false
+    };
+
     // Join the serial worker after invalidating every in-flight reconnect.
     drop(hue_dtls);
     drop(hue_status);
+    // Dropping the worker stops our stream; the bridge then restores the lights.
     drop(hue_reconnect);
+    if lights_off {
+        turn_off_tv_lights(&config, hue_application_id.as_deref());
+    }
 
     signal_task.abort();
     let _ = signal_task.await;
@@ -1847,6 +1916,42 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
     info!("lg-hue-sync terminated cleanly.");
     Ok(())
+}
+
+/// Turns off the Entertainment area's lights after our stream stopped, within 2 s so the unit's
+/// stop timeout holds; a late bridge request is abandoned and sends nothing after the deadline.
+fn turn_off_tv_lights(config: &Config, application_id: Option<&str>) {
+    const BOUND: Duration = Duration::from_secs(2);
+    let Some(configuration_id) = hue_configuration_id(config) else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + BOUND;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let config = config.clone();
+    let application_id = application_id.map(ToOwned::to_owned);
+    let spawned = std::thread::Builder::new()
+        .name("hue-lights-off".into())
+        .spawn(move || {
+            let _ = sender.send(hue::turn_off_entertainment_lights(
+                &config.bridge_ip,
+                &config.username,
+                &configuration_id,
+                application_id.as_deref(),
+                config.hue_trust(),
+                deadline,
+            ));
+        });
+    if let Err(error) = spawned {
+        warn!("TV off: Hue lights unchanged, no worker thread: {error}");
+        return;
+    }
+    match receiver.recv_timeout(BOUND) {
+        Ok(Ok((turned_off, listed))) => info!(
+            "TV off: turned off {turned_off} of {listed} Hue lights of the Entertainment area."
+        ),
+        Ok(Err(error)) => warn!("TV off: Hue lights unchanged: {error:#}"),
+        Err(_) => warn!("TV off: Hue lights-off abandoned after {BOUND:?}."),
+    }
 }
 
 async fn run_test_pattern(config_path: PathBuf) -> Result<()> {
