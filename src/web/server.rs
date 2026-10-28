@@ -1,4 +1,5 @@
 use super::diagnostics::{self, Diagnostics};
+use super::guards::{self, RateWindow, RequestLimits};
 use super::preview::{self, PreviewFrame, PreviewState};
 use crate::{
     color::RgbColor,
@@ -19,13 +20,20 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, info};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub const EMBEDDED_UI_HTML: &str = include_str!("ui.html");
+/// Every route but the preview renderer takes small JSON bodies.
+const DEFAULT_BODY_LIMIT: usize = 16 * 1024;
+/// A maximal preview frame (128 x 72 RGB, 27,648 values) is at most 110,592 bytes of compact
+/// JSON (`255,` per value), plus well under 2 KiB of settings.
+const PREVIEW_RENDER_BODY_LIMIT: usize = 128 * 1024;
+/// Each save rewrites config.json with fsync on the TV's flash.
+const API_CONFIG_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const CAPTURE_PATTERNS_HTML: &str = include_str!("../../calibration-patterns/capture.html");
 
 #[derive(Debug)]
@@ -341,6 +349,10 @@ pub struct SharedState {
     pub preview: PreviewState,
     preview_render_gate: Arc<Semaphore>,
     preview_render_started: std::sync::Mutex<Option<std::time::Instant>>,
+    /// One pairing or Hue area operation at a time; each can block a thread for up to 45 s.
+    setup_gate: Arc<Semaphore>,
+    /// Config writes requested through the API: save-config and Bonjour.
+    api_config_writes: RateWindow,
     diagnostics: RwLock<Diagnostics>,
     sync_status: RwLock<SyncStatus>,
     command_tx: mpsc::Sender<ControlCommand>,
@@ -379,6 +391,8 @@ impl SharedState {
             preview: PreviewState::default(),
             preview_render_gate: Arc::new(Semaphore::new(1)),
             preview_render_started: std::sync::Mutex::new(None),
+            setup_gate: Arc::new(Semaphore::new(1)),
+            api_config_writes: RateWindow::new(API_CONFIG_WRITE_INTERVAL),
             diagnostics: RwLock::new(Diagnostics::default()),
             sync_status: RwLock::new(SyncStatus {
                 requested_running: true,
@@ -631,6 +645,10 @@ enum ApiError {
     BadRequest(String),
     #[error("{0}")]
     SetupFailed(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    TooManyRequests(String),
 }
 
 impl IntoResponse for ApiError {
@@ -638,6 +656,8 @@ impl IntoResponse for ApiError {
         let status = match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::SetupFailed(_) => StatusCode::BAD_GATEWAY,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         };
         (
             status,
@@ -704,7 +724,11 @@ fn build_router(state: AppState) -> anyhow::Result<Router> {
     let (router, mut document) = OpenApiRouter::<AppState>::new()
         .routes(routes!(status))
         .routes(routes!(preview_frame))
-        .routes(routes!(preview_render))
+        .merge(
+            OpenApiRouter::new()
+                .routes(routes!(preview_render))
+                .layer(DefaultBodyLimit::max(PREVIEW_RENDER_BODY_LIMIT)),
+        )
         .routes(routes!(set_bonjour))
         .routes(routes!(start))
         .routes(routes!(stop))
@@ -739,7 +763,13 @@ fn build_router(state: AppState) -> anyhow::Result<Router> {
                 ))
             }),
         )
-        .layer(DefaultBodyLimit::max(512 * 1024))
+        .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))
+        .layer(axum::middleware::from_fn_with_state(
+            RequestLimits::default(),
+            guards::limit_requests,
+        ))
+        // Outermost: refuse a foreign Host or Origin before it takes a request slot.
+        .layer(axum::middleware::from_fn(guards::check_host_origin))
         .with_state(state))
 }
 
@@ -911,6 +941,7 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     post, path = "/api/bonjour", tag = "LG Hue Sync",
     request_body = BonjourSettings,
     responses(
+        (status = 429, description = "Config saved through the API less than 10 s ago; live settings stay applied", body = ErrorResponse),
         (status = 200, description = "Discovery preference saved and applied", body = BonjourSettings),
         (status = 400, description = "Malformed JSON", body = String, content_type = "text/plain"),
         (status = 413, description = "Request body too large", body = String, content_type = "text/plain"),
@@ -930,17 +961,22 @@ async fn set_bonjour(
             "discovery controller is unavailable".to_string(),
         ));
     }
+    let previous = claim_api_config_write(&state, "Discovery preference")?;
     let config_path = state.config_path.clone();
     let enabled = request.enabled;
-    tokio::task::spawn_blocking(move || {
+    let saved = tokio::task::spawn_blocking(move || {
         Config::update(&config_path, None, |config| {
             config.bonjour_enabled = enabled;
             Ok(())
         })
     })
     .await
-    .map_err(|error| ApiError::SetupFailed(format!("Discovery save task failed: {error}")))?
-    .map_err(|error| ApiError::SetupFailed(error.to_string()))?;
+    .map_err(|error| ApiError::SetupFailed(format!("Discovery save task failed: {error}")))
+    .and_then(|result| result.map_err(|error| ApiError::SetupFailed(error.to_string())));
+    if let Err(error) = saved {
+        state.shared.api_config_writes.restore(previous);
+        return Err(error);
+    }
     sender.send(enabled).map_err(|_| {
         ApiError::SetupFailed("discovery controller stopped after saving".to_string())
     })?;
@@ -1002,7 +1038,7 @@ async fn toggle(State(state): State<AppState>) -> Result<Json<StatusMessage>, Ap
     responses(
         (status = 200, description = "Success", body = StatusMessage),
         (status = 400, description = "Invalid request", content((ErrorResponse = "application/json"), (String = "text/plain"))),
-        (status = 413, description = "Request body exceeds the 512 KiB limit", body = String, content_type = "text/plain"),
+        (status = 413, description = "Request body exceeds the 16 KiB limit", body = String, content_type = "text/plain"),
         (status = 415, description = "JSON content type required", body = String, content_type = "text/plain"),
         (status = 422, description = "Invalid JSON fields or types", body = String, content_type = "text/plain"),
         (status = 502, description = "Controller, device or configuration operation failed", body = ErrorResponse)
@@ -1060,7 +1096,7 @@ async fn reset_preset(
     responses(
         (status = 200, description = "Success", body = StatusMessage),
         (status = 400, description = "Invalid request", content((ErrorResponse = "application/json"), (String = "text/plain"))),
-        (status = 413, description = "Request body exceeds the 512 KiB limit", body = String, content_type = "text/plain"),
+        (status = 413, description = "Request body exceeds the 16 KiB limit", body = String, content_type = "text/plain"),
         (status = 415, description = "JSON content type required", body = String, content_type = "text/plain"),
         (status = 422, description = "Invalid JSON fields or types", body = String, content_type = "text/plain"),
         (status = 502, description = "Controller, device or configuration operation failed", body = ErrorResponse)
@@ -1101,12 +1137,22 @@ async fn update_nanoleaf_alignment(
 #[utoipa::path(
     post, path = "/api/save-config", tag = "LG Hue Sync",
     responses(
+        (status = 429, description = "Config saved through the API less than 10 s ago; live settings stay applied", body = ErrorResponse),
         (status = 200, description = "Success", body = StatusMessage),
         (status = 502, description = "Controller, device or configuration operation failed", body = ErrorResponse)
     )
 )]
 async fn save_config(State(state): State<AppState>) -> Result<Json<StatusMessage>, ApiError> {
     let _guard = state.shared.settings_update_lock.lock().await;
+    let previous = claim_api_config_write(&state, "Configuration")?;
+    let saved = request_config_save(&state).await;
+    if saved.is_err() {
+        state.shared.api_config_writes.restore(previous);
+    }
+    saved.map(|()| Json(StatusMessage { status: "saved" }))
+}
+
+async fn request_config_save(state: &AppState) -> Result<(), ApiError> {
     let (ack_tx, ack_rx) = oneshot::channel();
     state
         .shared
@@ -1118,8 +1164,36 @@ async fn save_config(State(state): State<AppState>) -> Result<Json<StatusMessage
         .map_err(|_| {
             ApiError::SetupFailed("sync controller stopped before saving config".to_string())
         })?
-        .map_err(ApiError::SetupFailed)?;
-    Ok(Json(StatusMessage { status: "saved" }))
+        .map_err(ApiError::SetupFailed)
+}
+
+const SETUP_BUSY: &str = "Another pairing or Hue area operation is running; retry when it ends.";
+
+/// Pairing and Hue area routes share one permit, held until their blocking work ends.
+fn claim_setup(state: &AppState) -> Result<OwnedSemaphorePermit, ApiError> {
+    state
+        .shared
+        .setup_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::Conflict(SETUP_BUSY.to_string()))
+}
+
+/// Refuses an API config write within 10 s of the previous one. Live settings stay applied.
+fn claim_api_config_write(
+    state: &AppState,
+    what: &str,
+) -> Result<Option<std::time::Instant>, ApiError> {
+    let now = std::time::Instant::now();
+    let claim = state.shared.api_config_writes.try_claim(now);
+    claim.map_err(|wait| {
+        let retry = wait.as_secs() + 1;
+        let message = format!(
+            "{what} was saved less than 10 s ago and is not saved again yet. Live settings stay applied; retry in {retry} s."
+        );
+        ApiError::TooManyRequests(message)
+    })
+}
 }
 
 /// Queue pipeline restart.
@@ -1162,13 +1236,16 @@ async fn sync_bridge(
 #[utoipa::path(
     get, path = "/api/hue/areas", tag = "LG Hue Sync",
     responses(
+        (status = 409, description = "Another pairing or Hue area operation is running", body = ErrorResponse),
         (status = 200, description = "Success", body = HueAreasResponse),
         (status = 502, description = "Controller, device or configuration operation failed", body = ErrorResponse)
     )
 )]
 async fn hue_areas(State(state): State<AppState>) -> Result<Json<HueAreasResponse>, ApiError> {
+    let permit = claim_setup(&state)?;
     let config_path = state.config_path.clone();
     let response = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let config = Config::load(&config_path).map_err(|error| error.to_string())?;
         if config.bridge_ip.is_empty() || config.username.is_empty() {
             return Err("Pair a Hue Bridge before selecting an Entertainment Area".to_string());
@@ -1193,9 +1270,10 @@ async fn hue_areas(State(state): State<AppState>) -> Result<Json<HueAreasRespons
     post, path = "/api/hue/area", tag = "LG Hue Sync",
     request_body = SelectHueAreaRequest,
     responses(
+        (status = 409, description = "Another pairing or Hue area operation is running", body = ErrorResponse),
         (status = 200, description = "Success", body = StatusMessage),
         (status = 400, description = "Invalid request", content((ErrorResponse = "application/json"), (String = "text/plain"))),
-        (status = 413, description = "Request body exceeds the 512 KiB limit", body = String, content_type = "text/plain"),
+        (status = 413, description = "Request body exceeds the 16 KiB limit", body = String, content_type = "text/plain"),
         (status = 415, description = "JSON content type required", body = String, content_type = "text/plain"),
         (status = 422, description = "Invalid JSON fields or types", body = String, content_type = "text/plain"),
         (status = 502, description = "Controller, device or configuration operation failed", body = ErrorResponse)
@@ -1211,8 +1289,10 @@ async fn select_hue_area(
             "Select a Hue Entertainment Area".to_string(),
         ));
     }
+    let permit = claim_setup(&state)?;
     let config_path = state.config_path.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let config = Config::load(&config_path).map_err(|error| error.to_string())?;
         if config.bridge_ip.is_empty() || config.username.is_empty() {
             return Err("Pair a Hue Bridge before selecting an Entertainment Area".to_string());
@@ -1276,9 +1356,10 @@ async fn test_pattern(
     post, path = "/api/pair/hue", tag = "LG Hue Sync",
     request_body = PairRequest,
     responses(
+        (status = 409, description = "Another pairing or Hue area operation is running", body = ErrorResponse),
         (status = 200, description = "Success", body = StatusMessage),
         (status = 400, description = "Invalid request", content((ErrorResponse = "application/json"), (String = "text/plain"))),
-        (status = 413, description = "Request body exceeds the 512 KiB limit", body = String, content_type = "text/plain"),
+        (status = 413, description = "Request body exceeds the 16 KiB limit", body = String, content_type = "text/plain"),
         (status = 415, description = "JSON content type required", body = String, content_type = "text/plain"),
         (status = 422, description = "Invalid JSON fields or types", body = String, content_type = "text/plain"),
         (status = 502, description = "Controller, device or configuration operation failed", body = ErrorResponse)
@@ -1290,7 +1371,9 @@ async fn pair_hue(
 ) -> Result<Json<StatusMessage>, ApiError> {
     let config_path = state.config_path.clone();
     let bridge_ip = request.ip.filter(|ip| !ip.trim().is_empty());
+    let permit = claim_setup(&state)?;
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let bridge_ip = match bridge_ip {
             Some(ip) => validate_device_ip(&ip)?,
             None => {
@@ -1324,9 +1407,10 @@ async fn pair_hue(
     post, path = "/api/pair/nanoleaf", tag = "LG Hue Sync",
     request_body = PairRequest,
     responses(
+        (status = 409, description = "Another pairing or Hue area operation is running", body = ErrorResponse),
         (status = 200, description = "Success", body = StatusMessage),
         (status = 400, description = "Invalid request", content((ErrorResponse = "application/json"), (String = "text/plain"))),
-        (status = 413, description = "Request body exceeds the 512 KiB limit", body = String, content_type = "text/plain"),
+        (status = 413, description = "Request body exceeds the 16 KiB limit", body = String, content_type = "text/plain"),
         (status = 415, description = "JSON content type required", body = String, content_type = "text/plain"),
         (status = 422, description = "Invalid JSON fields or types", body = String, content_type = "text/plain"),
         (status = 502, description = "Controller, device or configuration operation failed", body = ErrorResponse)
@@ -1340,7 +1424,9 @@ async fn pair_nanoleaf(
         .ip
         .ok_or_else(|| ApiError::BadRequest("Nanoleaf controller IP is required".to_string()))?;
     let config_path = state.config_path.clone();
+    let permit = claim_setup(&state)?;
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let ip = validate_device_ip(&ip)?;
         let (auth_token, segments, panel_ids) =
             nanoleaf::pair_nanoleaf(&ip, 45).map_err(|error| error.to_string())?;
@@ -1586,13 +1672,88 @@ mod tests {
                 .status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
-        assert_eq!(
-            app.oneshot(request(" ".repeat(512 * 1024 + 1)))
+        // The largest frame the renderer validates fits the route's body limit.
+        let mut largest = payload.clone();
+        largest["frame"] = serde_json::json!({"width":128,"height":72,"rgb":vec![255u8; 27_648],"captured_unix_ms":u64::MAX});
+        let largest = largest.to_string();
+        assert!(largest.len() < PREVIEW_RENDER_BODY_LIMIT);
+        assert_ne!(
+            app.clone()
+                .oneshot(request(largest))
                 .await
                 .unwrap()
                 .status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
+        assert_eq!(
+            app.oneshot(request(" ".repeat(PREVIEW_RENDER_BODY_LIMIT + 1)))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn default_body_limit_rejects_oversized_json_on_normal_routes() {
+        use tower::ServiceExt;
+        let (app, _commands) = test_router();
+        let request = |body: String| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/settings")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let oversized = " ".repeat(DEFAULT_BODY_LIMIT + 1);
+        assert_eq!(
+            app.oneshot(request(oversized)).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_routes_share_one_permit_and_answer_409_while_busy() {
+        use tower::ServiceExt;
+        let (sender, _commands) = mpsc::channel(1);
+        let shared = Arc::new(SharedState::new(
+            settings(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            sender,
+        ));
+        let app = build_router(AppState {
+            shared: shared.clone(),
+            config_path: PathBuf::new(),
+            bonjour: Arc::new(Mutex::new(watch::channel(false).0)),
+        })
+        .unwrap();
+        let request = |method: &str, uri: &str, body: &'static str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let busy = shared.setup_gate.clone().try_acquire_owned().unwrap();
+        for (method, uri, body) in [
+            ("GET", "/api/hue/areas", ""),
+            ("POST", "/api/hue/area", r#"{"area_id":"area"}"#),
+            ("POST", "/api/pair/hue", "{}"),
+            ("POST", "/api/pair/nanoleaf", r#"{"ip":"192.0.2.20"}"#),
+        ] {
+            let response = app.clone().oneshot(request(method, uri, body)).await;
+            assert_eq!(response.unwrap().status(), StatusCode::CONFLICT, "{uri}");
+        }
+        drop(busy);
+        // With the permit free, the route runs and fails on the missing config instead.
+        let response = app.oneshot(request("GET", "/api/hue/areas", "")).await;
+        assert_ne!(response.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(shared.setup_gate.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -1645,6 +1806,8 @@ mod tests {
             bonjour: Arc::new(Mutex::new(bonjour)),
         };
         for enabled in [true, false] {
+            // Each iteration is a separate API write; reopen the 10 s write window.
+            state.shared.api_config_writes.restore(None);
             let response = set_bonjour(State(state.clone()), Json(BonjourSettings { enabled }))
                 .await
                 .unwrap();
@@ -1659,6 +1822,19 @@ mod tests {
                 enabled
             );
         }
+        // Another API write inside the 10 s window is refused and changes nothing.
+        let refused = set_bonjour(
+            State(state.clone()),
+            Json(BonjourSettings { enabled: true }),
+        )
+        .await;
+        assert!(matches!(refused, Err(ApiError::TooManyRequests(_))));
+        assert_eq!(
+            refused.err().unwrap().into_response().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(!Config::load(&path).unwrap().bonjour_enabled);
+        assert!(!changes.has_changed().unwrap());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(directory.join("config.json.lock")).unwrap();
         std::fs::remove_dir(directory).unwrap();

@@ -9,7 +9,7 @@ Native ambient-light synchronization for rooted LG webOS TVs. A Rust daemon capt
 
 ## Features
 
-- Root-only webOS capture through dynamically loaded `libvtcapture`/`dile_vt` APIs.
+- Root-only webOS capture through the dynamically loaded `libvtcapture` API.
 - Hue Entertainment API v2 over DTLS 1.2 PSK, including gradient member identity.
 - Nanoleaf 4D UDP streaming with 40-panel corner, direction, and offset alignment.
 - Independent Hue/Nanoleaf controls; TV sleep/wake following can be automatic or manual.

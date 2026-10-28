@@ -170,6 +170,8 @@ impl VtCapture {
                 LIBVTCAPTURE_PATH
             ));
         }
+        // Counts every attempt that reaches the driver, failed or not.
+        super::claim_capture_session()?;
 
         info!(
             "Loading webOS libvtcapture driver from {}...",

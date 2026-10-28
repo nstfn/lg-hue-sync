@@ -110,15 +110,15 @@ reply bound and stdin held until reply to avoid this firmware's EOF behavior.
 
 [`webosbrew/webos-userland`](https://github.com/webosbrew/webos-userland/tree/main) provides community headers and stub libraries for LG userland APIs; its [generated reference](https://www.webosbrew.org/webos-userland/index.html) is useful when reviewing capture bindings. Treat availability and ABI behavior as firmware-specific and keep defensive dynamic loading and frame checks in `src/capture/`.
 
-Use the [DILE VT reference](https://www.webosbrew.org/webos-userland/df/d73/dile__vt_8h.html)
-and [Hyperion's native backends](https://github.com/webosbrew/hyperion-webos/tree/main/unicapture/backends)
-as lifecycle references. The existing vtCapture owner performs stop, postprocess, finalize,
-and release; the DILE owner stops, unmaps buffers, and destroys its handle. Current DILE
-headers and older backend examples disagree on some function signatures, including Stop.
+Use [Hyperion's native backends](https://github.com/webosbrew/hyperion-webos/tree/main/unicapture/backends)
+as lifecycle references. The vtCapture owner performs stop, postprocess, finalize, and release.
+libvtcapture is the only native capture backend. The legacy DILE VT backend and its `/dev/mem`
+mapping were removed: when libvtcapture fails or is busy, the daemon holds no capture and
+retries the init on its capture backoff, at most one session every 2 seconds.
 Do not replace firmware-tested bindings solely to match generated documentation. Native
 stubs describe an ABI; they neither implement capture nor prove runtime availability.
 
-[`HyperHDR`](https://github.com/awawa-dev/HyperHDR) is an ambient-light design reference. Its [colour engine](https://github.com/awawa-dev/HyperHDR/wiki/Infinite-color-engine) retains float precision through averaging, correction, and smoothing; its [LUT calibration](https://github.com/awawa-dev/HyperHDR/wiki/lut-calibration) first identifies the source conversion. This daemon currently assumes BT.601 limited-range NV12 in both capture paths, then repeatedly converts processing results to 8-bit RGB. Hue xy output linearizes sRGB, but Hue Direct RGB expands each 8-bit channel to 16 bits without restoring precision. The legacy `hdr_tone_mapping` setting lifts midtones in 8-bit RGB and has no capture transfer or HDR metadata; new configurations leave it off, while existing configurations preserve their setting. It is not a validated HDR10/Dolby Vision conversion.
+[`HyperHDR`](https://github.com/awawa-dev/HyperHDR) is an ambient-light design reference. Its [colour engine](https://github.com/awawa-dev/HyperHDR/wiki/Infinite-color-engine) retains float precision through averaging, correction, and smoothing; its [LUT calibration](https://github.com/awawa-dev/HyperHDR/wiki/lut-calibration) first identifies the source conversion. This daemon currently assumes BT.601 limited-range NV12 in the capture path, then repeatedly converts processing results to 8-bit RGB. Hue xy output linearizes sRGB, but Hue Direct RGB expands each 8-bit channel to 16 bits without restoring precision. The legacy `hdr_tone_mapping` setting lifts midtones in 8-bit RGB and has no capture transfer or HDR metadata; new configurations leave it off, while existing configurations preserve their setting. It is not a validated HDR10/Dolby Vision conversion.
 
 Colour investigation order:
 

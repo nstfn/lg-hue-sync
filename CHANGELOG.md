@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep the Hue stream running through dashboard settings changes, presets and saves. A renewed event subscription now compares its snapshot with the last one of the same bridge, so only another area or changed channels or locations trigger a bridge sync. A topology change that arrives while the subscription renews is kept for the next one. A sync that finds the saved area unchanged no longer rewrites `config.json`.
 - Report why a configured Hue bridge IP was unreachable. The TCP connect error stays the root cause when rediscovery also fails, cached cloud discovery failures keep their full cause chain, and bridge sync failures log the whole chain. Paired-bridge rediscovery no longer suggests entering the IP manually.
 
+### Security
+- Remove the legacy DILE_VT capture backend. It mapped physical addresses returned by the driver through `/dev/mem`, read-write, with no range check, and its structure layout dated from webOS 6. libvtcapture is now the only native backend: a failed or busy init keeps no capture and retries on the existing capture backoff.
+- Space native capture sessions at least 2 s apart, whatever sequence of Start, Stop, Toggle, Restart or recovery requests them. A refused session start retries on the capture backoff.
+- Bound the HTTP API: JSON bodies are limited to 16 KiB (128 KiB for `POST /api/preview/render`, sized from its largest valid frame), at most 16 requests run at once (503 beyond), and each request times out after 10 s (504), 60 s for pairing and Hue area routes. Pairing and Hue area operations run one at a time; another one gets 409.
+- Refuse DNS rebinding and cross-site requests. A Host other than an IP literal, `localhost` or `lg-hue-sync.local` (each with an optional port) gets 421. A POST, PUT, PATCH or DELETE whose Origin header does not match the Host gets 403; requests without Origin, such as Home Assistant, curl and Shortcuts, are unchanged.
+- Limit flash writes of `config.json`. A save whose serialised bytes equal the file on disk is skipped. `POST /api/save-config` and `POST /api/bonjour` save at most once every 10 s; a request inside that window gets 429 and live settings stay applied.
+
 ## [1.0.0] - 2026-10-29
 
 ### Added

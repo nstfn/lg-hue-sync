@@ -1,5 +1,6 @@
 mod bonjour;
 mod diagnostics;
+mod guards;
 mod preview;
 pub mod server;
 

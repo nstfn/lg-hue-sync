@@ -1,6 +1,8 @@
-pub mod dile_vt;
+pub mod mock;
+pub mod source_fps;
 pub mod vtcapture;
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -127,8 +129,43 @@ pub trait ScreenCapture {
     }
 }
 
-pub use dile_vt::{detect_source_fps, DileVtCapture, MockCapture};
+pub use mock::MockCapture;
+pub use source_fps::detect_source_fps;
 pub use vtcapture::VtCapture;
+
+/// Each native session runs the full libvtcapture init and teardown on a 2-core TV, so no
+/// sequence of Start, Stop, Toggle or Restart commands may open sessions faster than this.
+pub const MIN_CAPTURE_SESSION_SPACING: Duration = Duration::from_secs(2);
+
+static LAST_CAPTURE_SESSION: Mutex<Option<Instant>> = Mutex::new(None);
+
+#[derive(Debug, thiserror::Error)]
+#[error("capture session spacing: next native session allowed in {0:?}")]
+pub struct SessionSpacingError(pub Duration);
+
+/// Returns the wait left before a new native session may start, or `None` when it may start.
+pub fn capture_session_wait(
+    last: Option<Instant>,
+    now: Instant,
+    min: Duration,
+) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(last?);
+    (elapsed < min).then(|| min - elapsed)
+}
+
+/// Claims the next native session slot. A refused claim is an init failure: the caller keeps
+/// the placeholder capture and the sync loop retries on its existing backoff.
+pub fn claim_capture_session() -> Result<(), SessionSpacingError> {
+    let mut last = LAST_CAPTURE_SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    if let Some(wait) = capture_session_wait(*last, now, MIN_CAPTURE_SESSION_SPACING) {
+        return Err(SessionSpacingError(wait));
+    }
+    *last = Some(now);
+    Ok(())
+}
 
 /// Drop the native owner before allowing another capture client to acquire the scaler.
 pub fn release_capture(capture: &mut Box<dyn ScreenCapture>) {
@@ -139,14 +176,14 @@ pub fn release_capture(capture: &mut Box<dyn ScreenCapture>) {
     ));
 }
 
-/// Creates a screen capture instance, prioritizing libvtcapture (webOS 6.x / C1 OLED),
-/// falling back to dile_vt, and finally to MockCapture.
+/// Creates the libvtcapture session. There is no other native backend: when libvtcapture fails
+/// or is busy, this returns the placeholder `MockCapture` (no hardware, no light output), and the
+/// sync loop retries the hardware init with its capture backoff.
 pub fn create_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
-    // 1. Try modern webOS libvtcapture (/usr/lib/libvtcapture.so.1)
     match VtCapture::try_new(width, height) {
         Ok(capture) => {
             info!("Initialized VtCapture driver (/usr/lib/libvtcapture.so.1) successfully.");
-            return Box::new(capture);
+            Box::new(capture)
         }
         Err(e) => {
             if e.downcast_ref::<NativeCaptureError>()
@@ -156,43 +193,30 @@ pub fn create_capture(width: u32, height: u32) -> Box<dyn ScreenCapture> {
                     "[-] Capture device is BUSY: /dev/video* hardware scaler is in use by another process (e.g. lg-hue-sync.service). Stop it before starting a manual capture session: systemctl stop lg-hue-sync"
                 );
             } else {
-                warn!(
-                    "VtCapture not available on this platform ({}). Trying DileVtCapture...",
-                    e
-                );
+                warn!("VtCapture init failed ({e:#}); hardware init will be retried.");
             }
+            Box::new(MockCapture::new(width, height))
         }
     }
-
-    // 2. Try legacy libdile_vt (/usr/lib/libdile_vt.so.0)
-    match DileVtCapture::try_new(width, height, 0) {
-        Ok(capture) => {
-            info!("Initialized DileVtCapture driver (/usr/lib/libdile_vt.so.0) successfully.");
-            return Box::new(capture);
-        }
-        Err(e) => {
-            if e.downcast_ref::<NativeCaptureError>()
-                .is_some_and(NativeCaptureError::is_busy)
-            {
-                error!(
-                    "[-] DileVtCapture device is BUSY: /dev/video* is in use by another process."
-                );
-            } else {
-                warn!(
-                    "DileVtCapture not available on this platform ({}). Falling back to MockCapture.",
-                    e
-                );
-            }
-        }
-    }
-
-    // 3. Fallback to synthetic MockCapture (host macOS, tests, CI)
-    Box::new(MockCapture::new(width, height))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_sessions_are_spaced_by_the_minimum_interval() {
+        let min = Duration::from_secs(2);
+        let start = Instant::now();
+        assert_eq!(capture_session_wait(None, start, min), None);
+        let soon = start + Duration::from_millis(500);
+        assert_eq!(
+            capture_session_wait(Some(start), soon, min),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(capture_session_wait(Some(start), start + min, min), None);
+        assert_eq!(capture_session_wait(Some(soon), start, min), Some(min));
+    }
 
     #[test]
     fn release_drops_native_owner_once_and_preserves_resolution() {
@@ -233,7 +257,7 @@ mod tests {
 
     fn transition() -> CaptureError {
         CaptureError::RestartRequired {
-            backend: "DILE_VT",
+            backend: "libvtcapture",
             reason: "format changed",
         }
     }

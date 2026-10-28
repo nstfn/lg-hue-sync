@@ -526,6 +526,10 @@ impl Config {
             NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         let json = serde_json::to_string_pretty(self)?;
+        // Every write is an fsync on the TV's flash; identical bytes would wear it for nothing.
+        if fs::read(path).is_ok_and(|current| current == json.as_bytes()) {
+            return Ok(());
+        }
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
@@ -852,6 +856,34 @@ mod tests {
         assert!(!changed && !path.exists());
         let (_, changed) = Config::update_if_changed(&path, Some(saved), |_| Ok(true)).unwrap();
         assert!(changed && path.exists());
+        let _ = std::fs::remove_file(&path);
+        let mut lock = path.into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_serialised_config_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!(
+            "lg-hue-sync-identical-{}-{}.json",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let initial = Config::new_default("", "", "", "");
+        Config::update(&path, Some(initial), |_| Ok(())).unwrap();
+        let written = std::fs::metadata(&path).unwrap().ino();
+        // `update` reports a change, but the serialised bytes equal the file: no rename.
+        Config::update(&path, None, |_| Ok(())).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), written);
+        Config::update(&path, None, |config| {
+            config.bonjour_enabled = !config.bonjour_enabled;
+            Ok(())
+        })
+        .unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), written);
         let _ = std::fs::remove_file(&path);
         let mut lock = path.into_os_string();
         lock.push(".lock");
