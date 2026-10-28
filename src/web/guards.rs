@@ -255,7 +255,10 @@ mod tests {
 
     fn guarded_router() -> Router {
         Router::new()
-            .route("/api/status", get(|| async { "ok" }).post(|| async { "ok" }))
+            .route(
+                "/api/status",
+                get(|| async { "ok" }).post(|| async { "ok" }),
+            )
             .layer(axum::middleware::from_fn(check_host_origin))
     }
 
