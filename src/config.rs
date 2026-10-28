@@ -834,7 +834,7 @@ mod tests {
         let saved = Config::new_default("192.0.2.1", "user", "key", "area");
         let mut synced = saved.clone();
         assert!(saved.hue_area() == synced.hue_area());
-        synced.zones[0].x_max = 0.25;
+        synced.zones[0].name.push_str(" moved");
         assert!(saved.hue_area() != synced.hue_area());
         let mut synced = saved.clone();
         synced.entertainment_configuration_id = Some("other".into());
