@@ -462,10 +462,6 @@ impl NanoleafPerimeterSampler {
         self.processor.set_spatial_blend(strength);
     }
 
-    pub fn set_smoothing_factor(&mut self, factor: f32) {
-        self.processor.set_smoothing(factor);
-    }
-
     pub fn set_temporal_response(&mut self, rise: f32, fall: f32) {
         self.processor.set_temporal_response(rise, fall);
     }
@@ -810,7 +806,7 @@ mod tests {
     fn nanoleaf_sampler_retains_sub_byte_fades_between_frames() {
         let ids = vec![1, 2, 3, 4];
         let mut sampler = NanoleafPerimeterSampler::new(4, &ids, false, 1.0, 0.0, 1.0);
-        sampler.set_smoothing_factor(0.05);
+        sampler.set_temporal_response(0.05, 0.05);
         sampler.set_peak_weight(0.0);
         let pixels = vec![1; 16];
         let mut result = Vec::new();

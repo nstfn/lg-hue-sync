@@ -818,12 +818,6 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     // Ownership loss suspends Hue only; Nanoleaf keeps its own session.
                     hue_status.blocked = true;
                 }
-                if let Some(ref mut sampler) = hue_sampler {
-                    sampler.set_smoothing_factor(state.smoothing_factor);
-                }
-                if let Some(ref mut sampler) = nanoleaf_sampler {
-                    sampler.set_smoothing_factor(state.smoothing_factor);
-                }
             }
         } else {
             hue_status.request(None);

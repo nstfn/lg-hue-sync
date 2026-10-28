@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Keep the configured rise and fall smoothing after Hue events. Every Hue Entertainment event (stream start, reconnect, the reconnect that follows a settings change) reset both to a hard-coded 0.35 carried by `StreamState`, so custom values and the presets' temporal response only held until the next event. Remove the invented `smoothing_factor` and `brightness` fields, which the bridge never supplies, and the setters that only served them.
+
 ## [1.0.0] - 2026-10-29
 
 ### Added

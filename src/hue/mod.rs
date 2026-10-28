@@ -791,8 +791,6 @@ pub struct StreamState {
     pub busy: bool,
     pub application_id: String,
     pub active_streamer: Option<String>,
-    pub brightness: f32,
-    pub smoothing_factor: f32,
 }
 
 pub fn parse_stream_state(configuration: &Value, application_id: &str) -> Result<StreamState> {
@@ -828,8 +826,6 @@ pub fn parse_stream_state(configuration: &Value, application_id: &str) -> Result
         busy: streaming && !ours,
         application_id: application_id.to_owned(),
         active_streamer,
-        brightness: 1.0,
-        smoothing_factor: 0.35,
     })
 }
 

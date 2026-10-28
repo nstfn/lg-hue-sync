@@ -269,12 +269,6 @@ impl ColorProcessor {
         1.0 + self.saturation_boost * saturation * saturation
     }
 
-    pub fn set_smoothing(&mut self, factor: f32) {
-        let factor = factor.clamp(0.05, 1.0);
-        self.rise = factor;
-        self.fall = factor;
-    }
-
     pub fn set_temporal_response(&mut self, rise: f32, fall: f32) {
         self.rise = rise.clamp(0.05, 1.0);
         self.fall = fall.clamp(0.05, 1.0);
@@ -421,11 +415,6 @@ impl ZoneSampler {
 
     pub fn set_spatial_blend(&mut self, strength: f32) {
         self.processor.set_spatial_blend(strength);
-    }
-
-    /// Dynamically update smoothing factor based on Hue mobile app sync intensity
-    pub fn set_smoothing_factor(&mut self, factor: f32) {
-        self.processor.set_smoothing(factor);
     }
 
     pub fn set_temporal_response(&mut self, rise: f32, fall: f32) {
