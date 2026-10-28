@@ -1032,7 +1032,10 @@ mod tests {
         configuration["active_streamer"]["rid"] = serde_json::json!(app);
         assert!(light_off_paths(&configuration, app).is_err());
         configuration["status"] = serde_json::json!("inactive");
-        configuration.as_object_mut().unwrap().remove("light_services");
+        configuration
+            .as_object_mut()
+            .unwrap()
+            .remove("light_services");
         assert!(light_off_paths(&configuration, app).unwrap().is_empty());
         assert!(light_off_paths(&serde_json::json!({}), app).is_err());
     }
