@@ -255,9 +255,15 @@ mod tests {
         let mut recovery = running_recovery(now);
         for expected_delay in [750, 1500, 3000] {
             for _ in 0..3 {
-                assert_eq!(recovery.failed(&unavailable(11), now), RecoveryAction::Retry);
+                assert_eq!(
+                    recovery.failed(&unavailable(11), now),
+                    RecoveryAction::Retry
+                );
             }
-            assert_eq!(recovery.failed(&unavailable(11), now), restart_ms(expected_delay));
+            assert_eq!(
+                recovery.failed(&unavailable(11), now),
+                restart_ms(expected_delay)
+            );
             // One valid frame must not erase the backoff for a flapping source.
             recovery.frame_received(now);
         }
@@ -309,10 +315,16 @@ mod tests {
         }
         // The first frame after restarts reports the recovery once.
         assert_eq!(recovery.frame_received(start), Some(3));
-        assert_eq!(recovery.frame_received(start + Duration::from_secs(29)), None);
+        assert_eq!(
+            recovery.frame_received(start + Duration::from_secs(29)),
+            None
+        );
         assert_eq!(recovery.failed(&transition(), start), restart_ms(6000));
         assert_eq!(recovery.frame_received(start), Some(1));
-        assert_eq!(recovery.frame_received(start + Duration::from_secs(30)), None);
+        assert_eq!(
+            recovery.frame_received(start + Duration::from_secs(30)),
+            None
+        );
         assert_eq!(recovery.restart_attempt(), 0);
         assert_eq!(recovery.failed(&transition(), start), restart_ms(750));
     }
@@ -323,11 +335,17 @@ mod tests {
         let mut recovery = CaptureRecovery::default();
         for step in 0..100 {
             let now = start + Duration::from_millis(step * 99);
-            assert_eq!(recovery.failed(&unavailable(13), now), RecoveryAction::Retry);
+            assert_eq!(
+                recovery.failed(&unavailable(13), now),
+                RecoveryAction::Retry
+            );
         }
         let expired = start + FIRST_FRAME_GRACE;
         for _ in 0..3 {
-            assert_eq!(recovery.failed(&unavailable(13), expired), RecoveryAction::Retry);
+            assert_eq!(
+                recovery.failed(&unavailable(13), expired),
+                RecoveryAction::Retry
+            );
         }
         assert_eq!(recovery.failed(&unavailable(13), expired), restart_ms(750));
 
@@ -335,11 +353,17 @@ mod tests {
         recovery.session_started();
         let restarted = expired + Duration::from_secs(1);
         for _ in 0..10 {
-            assert_eq!(recovery.failed(&unavailable(13), restarted), RecoveryAction::Retry);
+            assert_eq!(
+                recovery.failed(&unavailable(13), restarted),
+                RecoveryAction::Retry
+            );
         }
         let expired = restarted + FIRST_FRAME_GRACE;
         for _ in 0..3 {
-            assert_eq!(recovery.failed(&unavailable(13), expired), RecoveryAction::Retry);
+            assert_eq!(
+                recovery.failed(&unavailable(13), expired),
+                RecoveryAction::Retry
+            );
         }
         assert_eq!(recovery.failed(&unavailable(13), expired), restart_ms(1500));
 
@@ -347,7 +371,10 @@ mod tests {
         recovery.session_started();
         assert_eq!(recovery.frame_received(expired), Some(2));
         for _ in 0..3 {
-            assert_eq!(recovery.failed(&unavailable(13), expired), RecoveryAction::Retry);
+            assert_eq!(
+                recovery.failed(&unavailable(13), expired),
+                RecoveryAction::Retry
+            );
         }
         assert_eq!(recovery.failed(&unavailable(13), expired), restart_ms(3000));
     }
@@ -357,10 +384,16 @@ mod tests {
         let now = Instant::now();
         let mut recovery = running_recovery(now);
         for _ in 0..3 {
-            assert_eq!(recovery.failed(&unavailable(-5), now), RecoveryAction::Retry);
+            assert_eq!(
+                recovery.failed(&unavailable(-5), now),
+                RecoveryAction::Retry
+            );
         }
         recovery.frame_received(now);
-        assert_eq!(recovery.failed(&unavailable(-5), now), RecoveryAction::Retry);
+        assert_eq!(
+            recovery.failed(&unavailable(-5), now),
+            RecoveryAction::Retry
+        );
         let source = anyhow::Error::new(std::io::Error::from_raw_os_error(22))
             .context("NV12 dimensions invalid");
         let invalid = CaptureError::from(source);
