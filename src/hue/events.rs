@@ -179,7 +179,10 @@ impl HueEvents {
                     let (epoch, config) = command;
                     let Some(config) = config else { continue };
                     let key = bridge_key(&config);
-                    if baseline.as_ref().is_some_and(|(previous, _)| *previous != key) {
+                    if baseline
+                        .as_ref()
+                        .is_some_and(|(previous, _)| *previous != key)
+                    {
                         baseline = None;
                     }
                     let mut previous_configuration: Option<Value> = None;
@@ -269,7 +272,10 @@ impl HueEvents {
             let mut latest = self.latest.lock().unwrap();
             let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
             let missed_topology = latest.missed_topology
-                || latest.state.as_ref().is_some_and(|state| state.topology_changed);
+                || latest
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| state.topology_changed);
             *latest = Pending {
                 missed_topology,
                 ..Pending::default()
@@ -639,7 +645,7 @@ mod tests {
         for (key, value) in [
             ("id", json!("other")),
             ("channels", json!([{"channel_id": 1}])),
-            ("locations", json!({"service_locations": [{"position": {}}]})),
+            ("locations", json!({"service_locations": [{}]})),
         ] {
             let mut changed = snapshot.clone();
             changed[key] = value;
@@ -660,9 +666,11 @@ mod tests {
         assert!(latest.lock().unwrap().state.is_none());
         publish(&latest, &generation, 2, Ok(state(false)));
         let mut pending = latest.lock().unwrap();
-        assert!(take_latest(&mut pending, 2).unwrap().unwrap().topology_changed);
+        let first = take_latest(&mut pending, 2).unwrap().unwrap();
+        assert!(first.topology_changed);
         pending.state = Some(state(false));
-        assert!(!take_latest(&mut pending, 2).unwrap().unwrap().topology_changed);
+        let second = take_latest(&mut pending, 2).unwrap().unwrap();
+        assert!(!second.topology_changed);
     }
 
     #[test]
