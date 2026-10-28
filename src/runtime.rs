@@ -47,6 +47,10 @@ impl CaptureSourcePolicy {
     pub fn blocked(&self) -> bool {
         self.compatible == Some(false)
     }
+    /// Last known source class: `Some(true)` for HDMI, `Some(false)` for a known non-HDMI app.
+    pub fn compatible(&self) -> Option<bool> {
+        self.compatible
+    }
     pub fn manually_stopped(&self) -> bool {
         self.manually_stopped
     }
@@ -64,6 +68,25 @@ impl CaptureSourcePolicy {
     pub fn resumed(&mut self) {
         self.source_paused = false;
     }
+}
+
+/// Outside observations that may re-arm a capture fault; `None` is unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExternalState {
+    pub tv_active: Option<bool>,
+    pub hdmi_source: Option<bool>,
+}
+
+/// A fault retries only on a TV wake or a switch to HDMI, never on a steady state, so a
+/// persistent fault cannot loop; a manual Stop always wins.
+pub fn rearms_capture_fault(
+    before: ExternalState,
+    after: ExternalState,
+    manually_stopped: bool,
+) -> bool {
+    let woke = before.tv_active == Some(false) && after.tv_active == Some(true);
+    let hdmi_selected = before.hdmi_source == Some(false) && after.hdmi_source == Some(true);
+    !manually_stopped && (woke || hdmi_selected)
 }
 
 #[derive(Default)]
@@ -303,6 +326,31 @@ mod tests {
         };
         assert!(!pending.take_stop_if_running(PipelineState::Paused));
         assert_eq!(pending.desired_running, Some(true));
+    }
+
+    #[test]
+    fn capture_fault_rearms_on_tv_wake_or_hdmi_switch_only() {
+        let state = |tv_active, hdmi_source| ExternalState {
+            tv_active,
+            hdmi_source,
+        };
+        let standby = state(Some(false), Some(true));
+        let active = state(Some(true), Some(true));
+        let home = state(Some(true), Some(false));
+        assert!(rearms_capture_fault(standby, active, false));
+        assert!(rearms_capture_fault(home, active, false));
+        // A manual Stop is never overridden.
+        assert!(!rearms_capture_fault(standby, active, true));
+        assert!(!rearms_capture_fault(home, active, true));
+        // Steady states and other transitions never re-arm, so a fault cannot loop.
+        for steady in [standby, active, home, ExternalState::default()] {
+            assert!(!rearms_capture_fault(steady, steady, false));
+        }
+        assert!(!rearms_capture_fault(active, standby, false));
+        assert!(!rearms_capture_fault(active, home, false));
+        // Unknown observations are not a transition.
+        let unknown = ExternalState::default();
+        assert!(!rearms_capture_fault(unknown, active, false));
     }
 
     #[test]

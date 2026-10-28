@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Keep the configured rise and fall smoothing after Hue events. Every Hue Entertainment event (stream start, reconnect, the reconnect that follows a settings change) reset both to a hard-coded 0.35 carried by `StreamState`, so custom values and the presets' temporal response only held until the next event. Remove the invented `smoothing_factor` and `brightness` fields, which the bridge never supplies, and the setters that only served them.
+- Recover capture after HDMI renegotiation instead of pausing until a manual Start. Unavailable frames (libvtcapture code 13 "null buffer" while a source boots or a video starts) and undersized frame planes now restart capture with a backoff of 750 ms doubling to a 16 s cap, indefinitely; 30 s of healthy frames reset the backoff. A new capture session allows 10 s of unavailable frames before its first frame. Other invalid frames still pause, and the pause now clears on a TV wake or a switch to HDMI, never after a manual Stop. Restart attempts and the recovery are logged.
 
 ## [1.0.0] - 2026-10-29
 

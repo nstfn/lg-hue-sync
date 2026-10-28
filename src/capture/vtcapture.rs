@@ -537,13 +537,10 @@ impl ScreenCapture for VtCapture {
         }
 
         let (y_len, uv_len, _) = nv12_lengths(self.width, self.height, self.stride)?;
-        if buf_info.size0 < 0
-            || (buf_info.size0 as usize) < y_len
-            || (!buf_info.start_addr1.is_null()
-                && (buf_info.size1 < 0 || (buf_info.size1 as usize) < uv_len))
-        {
+        let size1 = (!buf_info.start_addr1.is_null()).then_some(buf_info.size1);
+        if let Err(error) = check_plane_sizes(buf_info.size0, size1, y_len, uv_len) {
             self.stop_stream();
-            return Err(anyhow!("capture driver returned undersized frame planes").into());
+            return Err(error);
         }
         // SAFETY: the driver reports non-null plane pointers and sizes covering these slices.
         // The capture handle remains active for the duration of this conversion.
@@ -615,9 +612,46 @@ impl Drop for VtCapture {
     }
 }
 
+/// Checks that the driver planes cover the NV12 frame; `size1` is `None` without a chroma plane.
+fn check_plane_sizes(
+    size0: c_int,
+    size1: Option<c_int>,
+    y_len: usize,
+    uv_len: usize,
+) -> std::result::Result<(), CaptureError> {
+    let covers = |size: c_int, len: usize| usize::try_from(size).is_ok_and(|size| size >= len);
+    let uv_covered = match size1 {
+        Some(size) => covers(size, uv_len),
+        None => true,
+    };
+    if covers(size0, y_len) && uv_covered {
+        return Ok(());
+    }
+    // HDMI renegotiation briefly reports short planes; a fresh session recovers, so restart.
+    Err(CaptureError::RestartRequired {
+        backend: "libvtcapture",
+        reason: "capture driver returned undersized frame planes",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undersized_planes_restart_capture_instead_of_pausing() {
+        assert!(check_plane_sizes(100, Some(50), 100, 50).is_ok());
+        assert!(check_plane_sizes(100, None, 100, 50).is_ok());
+        let mut recovery = crate::capture::CaptureRecovery::default();
+        for (size0, size1) in [(99, Some(50)), (-1, None), (100, Some(49)), (100, Some(-1))] {
+            let error = check_plane_sizes(size0, size1, 100, 50).unwrap_err();
+            assert!(matches!(error, CaptureError::RestartRequired { .. }));
+            assert!(matches!(
+                recovery.failed(&error, std::time::Instant::now()),
+                crate::capture::RecoveryAction::Restart(_)
+            ));
+        }
+    }
 
     #[test]
     fn test_vtcapture_struct_sizes() {

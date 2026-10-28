@@ -33,7 +33,7 @@ use hue::{
     reconnect::HueReconnect, sync_entertainment_areas, HueDtlsClient, HueStreamPacketBuilder,
 };
 use nanoleaf::{NanoleafPerimeterSampler, NanoleafUdpStreamer};
-use runtime::{CaptureSourcePolicy, PendingCommands, PipelineState, RetryState};
+use runtime::{CaptureSourcePolicy, ExternalState, PendingCommands, PipelineState, RetryState};
 use setup::{run_pair, run_pair_nanoleaf, run_sync_hue};
 use web::{start_web_server, CalibrationPattern, LiveSettings, SharedState, SyncState};
 
@@ -880,6 +880,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 pending_commands.receive(&mut command_rx);
                 source_policy.manual_request(pending_commands.manual_running.take());
                 watchdog.tick();
+                let external_before = ExternalState {
+                    tv_active: observed_tv_power,
+                    hdmi_source: source_policy.compatible(),
+                };
                 if last_source_poll.elapsed() >= Duration::from_secs(2) {
                     last_source_poll = tokio::time::Instant::now();
                     source_policy
@@ -907,13 +911,6 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 }
 
                 let mut requested_running = pending_commands.desired_running.take();
-                if capture_faulted {
-                    if requested_running != Some(true) && !source_policy.auto_resume() {
-                        continue;
-                    }
-                    // A manual Start retries a fault; TV/app auto-resume must not loop on it.
-                    pending_commands.restart = true;
-                }
                 let mut start_requested =
                     requested_running == Some(true) || source_policy.auto_resume();
                 if auto_tv_power && last_tv_power_poll.elapsed() >= Duration::from_secs(2) {
@@ -940,6 +937,27 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             }
                         }
                     }
+                }
+                if capture_faulted {
+                    // A manual Start or a TV wake / HDMI switch retries a fault; steady
+                    // TV/app states must not loop on it.
+                    let rearmed = runtime::rearms_capture_fault(
+                        external_before,
+                        ExternalState {
+                            tv_active: observed_tv_power,
+                            hdmi_source: source_policy.compatible(),
+                        },
+                        source_policy.manually_stopped(),
+                    );
+                    let retry = rearmed || start_requested;
+                    if !retry {
+                        continue;
+                    }
+                    if rearmed {
+                        info!("TV woke or HDMI was selected; retrying faulted capture.");
+                        start_requested = true;
+                    }
+                    pending_commands.restart = true;
                 }
                 let app_reactivated = if !start_requested
                     && !source_policy.manually_stopped()
@@ -1430,6 +1448,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 Ok(hw_capture) => {
                     info!("[+] Successfully upgraded from MockCapture to hardware VtCapture!");
                     capture = Box::new(hw_capture);
+                    capture_recovery.session_started();
                     capture_retry.success();
                     shared_state.capture_hardware.store(true, Ordering::Relaxed);
                 }
@@ -1449,7 +1468,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             Ok(frame) => {
                 if hardware_frame {
                     shared_state.preview.publish(&frame);
-                    capture_recovery.frame_received(std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    if let Some(restarts) = capture_recovery.frame_received(now) {
+                        info!("Capture recovered after {restarts} restart(s).");
+                    }
                     shared_state.set_sync_state(SyncState::Running, None);
                 }
                 let mut is_scene_cut = false;
@@ -1656,7 +1678,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             }
             Err(e) => {
                 shared_state.set_sync_state(SyncState::Recovering, Some(e.to_string()));
-                let delay = match capture_recovery.failed(&e) {
+                let delay = match capture_recovery.failed(&e, std::time::Instant::now()) {
                     RecoveryAction::Retry => {
                         if !runtime::wait_for_capture_retry(frame_interval, &shutdown).await {
                             break 'sync_loop;
@@ -1664,7 +1686,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         continue 'sync_loop;
                     }
                     RecoveryAction::Pause => {
-                        error!("Capture paused ({e:#}); invalid frame or recovery limit reached. Use Start or Restart to retry.");
+                        error!("Capture paused ({e:#}); invalid frame. Start, Restart, a TV wake or an HDMI switch retries.");
                         capture = Box::new(MockCapture::new(
                             config.capture_width,
                             config.capture_height,
@@ -1679,7 +1701,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     }
                     RecoveryAction::Restart(delay) => delay,
                 };
-                warn!("Capture recovery ({e:#}); releasing hardware scaler, retrying in {delay:?}");
+                let attempt = capture_recovery.restart_attempt();
+                warn!("Capture recovery ({e:#}); releasing hardware scaler, restart attempt {attempt} in {delay:?}");
                 capture = Box::new(MockCapture::new(
                     config.capture_width,
                     config.capture_height,
@@ -1732,6 +1755,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
                 // Re-initialize capture driver
                 capture = create_capture(config.capture_width, config.capture_height);
+                capture_recovery.session_started();
                 shared_state
                     .capture_hardware
                     .store(capture.is_real_hardware(), Ordering::Relaxed);
