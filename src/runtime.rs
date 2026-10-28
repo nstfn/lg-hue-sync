@@ -269,6 +269,58 @@ pub async fn system_state(program: &str, deadline: Duration) -> Option<String> {
     state
 }
 
+/// The steps of a shutdown that turns the Hue lights off, injectable for tests.
+pub trait ShutdownLightsSteps {
+    /// Asks the bridge to stop our Entertainment stream; returns at once.
+    fn stop_stream(&mut self);
+    /// True once the stop request has completed.
+    fn stream_stopped(&self) -> bool;
+    /// Turns the area's lights off within its own bound.
+    fn lights_off(&mut self);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownLights {
+    Unchanged,
+    Off,
+    StopTimedOut,
+}
+
+/// The bridge restores the lights' pre-stream state when our stream stops, so a lights-off sent
+/// while the stream runs is undone. Our stream stops first; the lights go off only once the stop
+/// completed within `stop_bound`. A restart (`lights_off` false) runs no step.
+pub async fn shutdown_lights_off(
+    lights_off: bool,
+    stop_bound: Duration,
+    steps: &mut impl ShutdownLightsSteps,
+) -> ShutdownLights {
+    if !lights_off {
+        return ShutdownLights::Unchanged;
+    }
+    steps.stop_stream();
+    let deadline = Instant::now() + stop_bound;
+    while !steps.stream_stopped() {
+        if Instant::now() >= deadline {
+            return ShutdownLights::StopTimedOut;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    steps.lights_off();
+    ShutdownLights::Off
+}
+
+/// The second pass after a standby lights-off runs only in `Off` mode with Hue sync on, while the
+/// TV is still seen in standby and our stream stays down. The bridge check that follows refuses
+/// any active stream, ours or another application's.
+pub fn tv_off_second_pass_due(
+    mode: TvOffLights,
+    hue_sync_enabled: bool,
+    tv_active: Option<bool>,
+    our_stream: bool,
+) -> bool {
+    mode == TvOffLights::Off && hue_sync_enabled && tv_active == Some(false) && !our_stream
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +351,79 @@ mod tests {
         // Another application streams, or we never streamed: the lights are not ours.
         assert!(!tv_off_lights_due(TvOffLights::Off, true, false, true));
         assert!(!tv_off_lights_due(TvOffLights::Off, true, true, false));
+    }
+
+    struct RecordedSteps {
+        events: Vec<&'static str>,
+        stops_after: Option<usize>,
+        polls: std::cell::Cell<usize>,
+    }
+
+    impl RecordedSteps {
+        fn new(stops_after: Option<usize>) -> Self {
+            Self {
+                events: Vec::new(),
+                stops_after,
+                polls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ShutdownLightsSteps for RecordedSteps {
+        fn stop_stream(&mut self) {
+            self.events.push("stop");
+        }
+
+        fn stream_stopped(&self) -> bool {
+            assert_eq!(self.events, ["stop"], "polled before the stop request");
+            self.polls.set(self.polls.get() + 1);
+            self.stops_after.is_some_and(|polls| self.polls.get() > polls)
+        }
+
+        fn lights_off(&mut self) {
+            self.events.push("off");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_our_stream_before_the_lights_go_off() {
+        let mut steps = RecordedSteps::new(Some(3));
+        let outcome = shutdown_lights_off(true, Duration::from_secs(4), &mut steps).await;
+        assert_eq!(outcome, ShutdownLights::Off);
+        assert_eq!(steps.events, ["stop", "off"]);
+        assert_eq!(steps.polls.get(), 4);
+    }
+
+    #[tokio::test]
+    async fn shutdown_skips_lights_off_when_the_stop_times_out() {
+        let mut steps = RecordedSteps::new(None);
+        let started = Instant::now();
+        let outcome = shutdown_lights_off(true, Duration::from_millis(50), &mut steps).await;
+        assert_eq!(outcome, ShutdownLights::StopTimedOut);
+        assert_eq!(steps.events, ["stop"]);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn restart_runs_no_shutdown_lights_step() {
+        let mut steps = RecordedSteps::new(Some(0));
+        let outcome = shutdown_lights_off(false, Duration::from_secs(4), &mut steps).await;
+        assert_eq!(outcome, ShutdownLights::Unchanged);
+        assert!(steps.events.is_empty());
+        assert_eq!(steps.polls.get(), 0);
+    }
+
+    #[test]
+    fn second_pass_needs_off_mode_a_tv_still_off_and_no_stream_of_ours() {
+        use TvOffLights::{Off, Restore};
+        assert!(tv_off_second_pass_due(Off, true, Some(false), false));
+        // The TV is on again, or its state is unknown.
+        assert!(!tv_off_second_pass_due(Off, true, Some(true), false));
+        assert!(!tv_off_second_pass_due(Off, true, None, false));
+        // Our stream runs or restarts.
+        assert!(!tv_off_second_pass_due(Off, true, Some(false), true));
+        assert!(!tv_off_second_pass_due(Restore, true, Some(false), false));
+        assert!(!tv_off_second_pass_due(Off, false, Some(false), false));
     }
 
     #[tokio::test]

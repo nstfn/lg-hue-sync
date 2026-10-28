@@ -103,7 +103,9 @@ before streaming. The daemon never touches the lights while another application
 streams or while Hue sync is off. A SIGTERM turns the lights off only when
 `systemctl is-system-running` reports `stopping`, or, if that check fails within
 1 s, when the TV was last seen in standby. A `systemctl restart` or a binary
-update with the TV on leaves the lights unchanged. When the TV wakes, the stream
+update with the TV on leaves the lights unchanged. At a SIGTERM the stream stop
+must complete within 4 s before the lights go off. After a standby, a second pass
+5 s later turns off the area's lights still on. When the TV wakes, the stream
 starts again and drives the lights.
 
 ## Codex project setup

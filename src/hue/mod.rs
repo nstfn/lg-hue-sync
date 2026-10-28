@@ -871,6 +871,10 @@ pub fn fetch_stream_configuration(
     }
     let path = format!("/clip/v2/resource/entertainment_configuration/{configuration_id}");
     let (json, _) = fetch_v2_resource(bridge_ip, username, &path, trust)?;
+    selected_configuration(&json, configuration_id)
+}
+
+fn selected_configuration(json: &Value, configuration_id: &str) -> Result<Value> {
     json.get("data")
         .and_then(Value::as_array)
         .and_then(|items| {
@@ -939,11 +943,80 @@ pub fn turn_off_entertainment_lights(
     };
     let configuration = fetch_stream_configuration(bridge_ip, username, configuration_id, trust)?;
     let paths = light_off_paths(&configuration, &application_id)?;
+    let turned_off = put_lights_off(bridge_ip, username, &paths, trust, deadline);
+    Ok((turned_off, paths.len()))
+}
+
+/// The configuration's lights that the light-state reply (`data[].on.on`) reports on, as CLIP v2
+/// light paths. Fails like `light_off_paths` while any application streams to the configuration.
+pub fn lit_light_off_paths(
+    configuration: &Value,
+    application_id: &str,
+    lights: &Value,
+) -> Result<Vec<String>> {
+    let lit = lights
+        .get("data")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|light| light.pointer("/on/on").and_then(Value::as_bool) == Some(true))
+        .filter_map(|light| light.get("id").and_then(Value::as_str))
+        .map(|id| format!("/clip/v2/resource/light/{}", id.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    let mut paths = light_off_paths(configuration, application_id)?;
+    paths.retain(|path| lit.contains(path));
+    Ok(paths)
+}
+
+/// Second pass after a standby lights-off: the bridge may re-apply its post-stream restore late.
+/// Re-reads the configuration and the light states, then turns off only the lights still on.
+/// Every request, the reads included, ends by `deadline`. Returns the lights turned off and the
+/// lights found on.
+pub fn turn_off_lit_entertainment_lights(
+    bridge_ip: &str,
+    username: &str,
+    configuration_id: &str,
+    application_id: Option<&str>,
+    trust: BridgeTrust<'_>,
+    deadline: Instant,
+) -> Result<(usize, usize)> {
+    if !valid_configuration_id(configuration_id) {
+        return Err(anyhow!("Invalid Hue Entertainment configuration UUID"));
+    }
+    let until = Some(deadline);
+    let application_id = match application_id {
+        Some(id) => id.to_owned(),
+        None => {
+            let response =
+                raw_request_until(bridge_ip, username, "GET", "/auth/v1", None, trust, until)?;
+            application_id_header(&response.headers)?
+        }
+    };
+    let path = format!("/clip/v2/resource/entertainment_configuration/{configuration_id}");
+    let (json, _) = v2_request_until(bridge_ip, username, "GET", &path, None, trust, until)?;
+    let configuration = selected_configuration(&json, configuration_id)?;
+    let all = "/clip/v2/resource/light";
+    let (lights, _) = v2_request_until(bridge_ip, username, "GET", all, None, trust, until)?;
+    let paths = lit_light_off_paths(&configuration, &application_id, &lights)?;
+    let turned_off = put_lights_off(bridge_ip, username, &paths, trust, deadline);
+    Ok((turned_off, paths.len()))
+}
+
+/// Sends `{"on":{"on":false}}` to each path; no request starts or sends after `deadline`.
+/// Returns the lights the bridge accepted.
+fn put_lights_off(
+    bridge_ip: &str,
+    username: &str,
+    paths: &[String],
+    trust: BridgeTrust<'_>,
+    deadline: Instant,
+) -> usize {
     let until = Some(deadline);
     // One connection per light, in parallel, so the deadline covers the whole area.
-    let turned_off = thread::scope(|scope| {
+    thread::scope(|scope| {
         let mut requests = Vec::with_capacity(paths.len());
-        for path in &paths {
+        for path in paths {
             requests.push(scope.spawn(move || {
                 let off = serde_json::json!({ "on": { "on": false } });
                 v2_request_until(bridge_ip, username, "PUT", path, Some(&off), trust, until)
@@ -954,8 +1027,7 @@ pub fn turn_off_entertainment_lights(
             .map(|request| request.join())
             .filter(|result| matches!(result, Ok(Ok(_))))
             .count()
-    });
-    Ok((turned_off, paths.len()))
+    })
 }
 
 #[allow(dead_code)]
@@ -1038,6 +1110,57 @@ mod tests {
             .remove("light_services");
         assert!(light_off_paths(&configuration, app).unwrap().is_empty());
         assert!(light_off_paths(&serde_json::json!({}), app).is_err());
+    }
+
+    #[test]
+    fn second_pass_turns_off_only_the_area_lights_still_on() {
+        let app = "12345678-1234-1234-1234-123456789abc";
+        let other = "12345678-1234-1234-1234-123456789abd";
+        let lit = "aaaaaaaa-1234-1234-1234-123456789abc";
+        let unlit = "bbbbbbbb-1234-1234-1234-123456789abc";
+        let strip = "CCCCCCCC-1234-1234-1234-123456789ABC";
+        let outside = "dddddddd-1234-1234-1234-123456789abc";
+        let mut area = serde_json::json!({
+            "id": "12345678-0000-0000-0000-123456789abc",
+            "type": "entertainment_configuration",
+            "status": "inactive",
+            "light_services": [
+                {"rid": lit, "rtype": "light"},
+                {"rid": unlit, "rtype": "light"},
+                {"rid": strip, "rtype": "light"}
+            ]
+        });
+        // The shape of GET /clip/v2/resource/light.
+        let lights = serde_json::json!({
+            "errors": [],
+            "data": [
+                {"id": lit, "type": "light", "on": {"on": true}},
+                {"id": unlit, "type": "light", "on": {"on": false}},
+                {"id": strip.to_ascii_lowercase(), "type": "light", "on": {"on": true}},
+                {"id": outside, "type": "light", "on": {"on": true}}
+            ]
+        });
+        let paths = lit_light_off_paths(&area, app, &lights).unwrap();
+        let lit_path = format!("/clip/v2/resource/light/{lit}");
+        let strip_path = format!("/clip/v2/resource/light/{}", strip.to_ascii_lowercase());
+        assert_eq!(paths, [lit_path, strip_path]);
+        // All lights already off, or a reply without light states: no request.
+        let off = serde_json::json!({
+            "errors": [],
+            "data": [
+                {"id": lit, "on": {"on": false}},
+                {"id": strip, "on": {"on": false}}
+            ]
+        });
+        assert!(lit_light_off_paths(&area, app, &off).unwrap().is_empty());
+        let empty = serde_json::json!({"errors": []});
+        assert!(lit_light_off_paths(&area, app, &empty).unwrap().is_empty());
+        // Any active stream, another application's or ours, means no request.
+        area["status"] = serde_json::json!("active");
+        area["active_streamer"] = serde_json::json!({"rtype": "auth_v1", "rid": other});
+        assert!(lit_light_off_paths(&area, app, &lights).is_err());
+        area["active_streamer"]["rid"] = serde_json::json!(app);
+        assert!(lit_light_off_paths(&area, app, &lights).is_err());
     }
 
     #[test]

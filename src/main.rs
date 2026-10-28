@@ -544,6 +544,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let tv_off_lights = config.tv_off_lights;
     // Set at a TV standby that stops our stream; the lights go off once the stop has settled.
     let mut tv_off_lights_pending: Option<tokio::time::Instant> = None;
+    // Set after a standby lights-off: a second pass catches a late bridge restore.
+    let mut second_pass_at: Option<tokio::time::Instant> = None;
     let mut hue_application_id: Option<String> = None;
 
     let mut hue_sampler = if hue_active {
@@ -915,9 +917,23 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     } else if hue_reconnect.is_settled() {
                         tv_off_lights_pending = None;
                         turn_off_tv_lights(&config, hue_application_id.as_deref());
+                        second_pass_at = Some(tokio::time::Instant::now() + SECOND_PASS_DELAY);
                     } else if since.elapsed() >= Duration::from_secs(10) {
                         tv_off_lights_pending = None;
                         warn!("TV standby: Hue stream did not stop in 10 s; lights unchanged.");
+                    }
+                }
+                if second_pass_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    second_pass_at = None;
+                    if runtime::tv_off_second_pass_due(
+                        tv_off_lights,
+                        hue_active && hue_sync_enabled,
+                        observed_tv_power,
+                        hue_dtls.is_some() || hue_reconnect.pending(),
+                    ) {
+                        recheck_tv_off_lights(&config, hue_application_id.as_deref());
+                    } else {
+                        info!("TV standby: second pass skipped, the TV or the Hue stream is back.");
                     }
                 }
                 let external_before = ExternalState {
@@ -1039,6 +1055,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 {
                     source_policy.resumed();
                     tv_off_lights_pending = None;
+                    second_pass_at = None;
                     hue_status.request(None);
                     info!(
                         "Sync resume requested! Reactivating Hue & Nanoleaf streaming sessions..."
@@ -1898,12 +1915,21 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
     // Join the serial worker after invalidating every in-flight reconnect.
     drop(hue_dtls);
-    drop(hue_status);
-    // Dropping the worker stops our stream; the bridge then restores the lights.
-    drop(hue_reconnect);
-    if lights_off {
-        turn_off_tv_lights(&config, hue_application_id.as_deref());
+    // The bridge restores the lights' pre-stream state when our stream stops, so the stop comes
+    // first and must complete before the lights go off. Bounds: 1 s system state, 4 s stream
+    // stop, 2 s lights off, inside the unit's 10 s stop timeout. No second pass at shutdown.
+    let mut steps = HueShutdownSteps {
+        reconnect: &mut hue_reconnect,
+        config: &config,
+        application_id: hue_application_id.as_deref(),
+    };
+    let outcome = runtime::shutdown_lights_off(lights_off, HUE_STOP_BOUND, &mut steps).await;
+    if outcome == runtime::ShutdownLights::StopTimedOut {
+        warn!("Shutdown: Hue stream did not stop in {HUE_STOP_BOUND:?}; lights unchanged.");
     }
+    drop(hue_status);
+    // Without a lights-off, dropping the worker stops our stream here.
+    drop(hue_reconnect);
 
     signal_task.abort();
     let _ = signal_task.await;
@@ -1918,10 +1944,39 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Bound of one lights-off pass, so the unit's stop timeout holds.
+const TV_OFF_LIGHTS_BOUND: Duration = Duration::from_secs(2);
+/// Bound of the stream stop that must precede a lights-off at shutdown.
+const HUE_STOP_BOUND: Duration = Duration::from_secs(4);
+/// Delay from a standby lights-off to its second pass.
+const SECOND_PASS_DELAY: Duration = Duration::from_secs(5);
+
+/// The shutdown lights-off steps on the live Hue worker: the stop goes through the serial
+/// reconnect worker, the same path a TV standby relies on.
+struct HueShutdownSteps<'a> {
+    reconnect: &'a mut HueReconnect<ConnectedHue>,
+    config: &'a Config,
+    application_id: Option<&'a str>,
+}
+
+impl runtime::ShutdownLightsSteps for HueShutdownSteps<'_> {
+    fn stop_stream(&mut self) {
+        self.reconnect.request(None);
+    }
+
+    fn stream_stopped(&self) -> bool {
+        self.reconnect.is_settled()
+    }
+
+    fn lights_off(&mut self) {
+        turn_off_tv_lights(self.config, self.application_id);
+    }
+}
+
 /// Turns off the Entertainment area's lights after our stream stopped, within 2 s so the unit's
 /// stop timeout holds; a late bridge request is abandoned and sends nothing after the deadline.
 fn turn_off_tv_lights(config: &Config, application_id: Option<&str>) {
-    const BOUND: Duration = Duration::from_secs(2);
+    const BOUND: Duration = TV_OFF_LIGHTS_BOUND;
     let Some(configuration_id) = hue_configuration_id(config) else {
         return;
     };
@@ -1951,6 +2006,38 @@ fn turn_off_tv_lights(config: &Config, application_id: Option<&str>) {
         ),
         Ok(Err(error)) => warn!("TV off: Hue lights unchanged: {error:#}"),
         Err(_) => warn!("TV off: Hue lights-off abandoned after {BOUND:?}."),
+    }
+}
+
+/// Second pass after a standby lights-off, on its own thread so the main loop never waits. Every
+/// bridge request ends within 2 s; the worker logs its own result.
+fn recheck_tv_off_lights(config: &Config, application_id: Option<&str>) {
+    let Some(configuration_id) = hue_configuration_id(config) else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + TV_OFF_LIGHTS_BOUND;
+    let config = config.clone();
+    let application_id = application_id.map(ToOwned::to_owned);
+    let spawned = std::thread::Builder::new()
+        .name("hue-lights-recheck".into())
+        .spawn(move || {
+            let result = hue::turn_off_lit_entertainment_lights(
+                &config.bridge_ip,
+                &config.username,
+                &configuration_id,
+                application_id.as_deref(),
+                config.hue_trust(),
+                deadline,
+            );
+            match result {
+                Ok((turned_off, lit)) => info!(
+                    "TV standby second pass: turned off {turned_off} of {lit} Hue lights still on."
+                ),
+                Err(error) => warn!("TV standby second pass: Hue lights unchanged: {error:#}"),
+            }
+        });
+    if let Err(error) = spawned {
+        warn!("TV standby second pass: Hue lights unchanged, no worker thread: {error}");
     }
 }
 
