@@ -47,7 +47,7 @@ pub enum ConfigError {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LightZone {
     pub channel_id: u8,
     pub name: String,
@@ -388,6 +388,17 @@ impl Config {
         self.zones = paired.area.map(|area| area.zones).unwrap_or_default();
     }
 
+    /// The fields a Hue bridge sync persists, compared to skip an unchanged write.
+    pub fn hue_area(&self) -> (&str, Option<&str>, Option<&str>, Option<&str>, &[LightZone]) {
+        (
+            &self.entertainment_area_id,
+            self.entertainment_configuration_id.as_deref(),
+            self.hue_bridge_id.as_deref(),
+            self.hue_bridge_certificate_sha256.as_deref(),
+            &self.zones,
+        )
+    }
+
     pub fn hue_trust(&self) -> crate::hue::BridgeTrust<'_> {
         crate::hue::BridgeTrust {
             bridge_id: self.hue_bridge_id.as_deref(),
@@ -474,6 +485,17 @@ impl Config {
         on_missing: Option<Self>,
         mutate: impl FnOnce(&mut Self) -> anyhow::Result<()>,
     ) -> anyhow::Result<Self> {
+        Self::update_if_changed(path, on_missing, |config| mutate(config).map(|()| true))
+            .map(|(config, _)| config)
+    }
+
+    /// Like `update`, but `mutate` reports whether it changed anything; an unchanged result
+    /// skips the write, so a repeated sync does not wear the TV's flash.
+    pub fn update_if_changed<P: AsRef<Path>>(
+        path: P,
+        on_missing: Option<Self>,
+        mutate: impl FnOnce(&mut Self) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<(Self, bool)> {
         let path = path.as_ref();
         let _process_lock = CONFIG_WRITE_MUTEX.lock().map_err(|_| ConfigError::Lock {
             path: path.to_path_buf(),
@@ -489,9 +511,11 @@ impl Config {
             }
             (Err(error), _) => return Err(error.into()),
         };
-        mutate(&mut config)?;
-        config.save_unlocked(path)?;
-        Ok(config)
+        let changed = mutate(&mut config)?;
+        if changed {
+            config.save_unlocked(path)?;
+        }
+        Ok((config, changed))
     }
 
     fn save_unlocked(&self, path: &Path) -> Result<(), ConfigError> {
@@ -803,6 +827,35 @@ mod tests {
         assert_eq!((saved.capture_width, saved.capture_height), (370, 230));
         fs::remove_file(&path).unwrap();
         fs::remove_file(format!("{}.lock", path.display())).unwrap();
+    }
+
+    #[test]
+    fn unchanged_hue_area_is_detected_and_skips_the_write() {
+        let saved = Config::new_default("192.0.2.1", "user", "key", "area");
+        let mut synced = saved.clone();
+        assert!(saved.hue_area() == synced.hue_area());
+        synced.zones[0].x_max = 0.25;
+        assert!(saved.hue_area() != synced.hue_area());
+        let mut synced = saved.clone();
+        synced.entertainment_configuration_id = Some("other".into());
+        assert!(saved.hue_area() != synced.hue_area());
+
+        // A missing file stays missing when nothing changed: no write happened.
+        let path = std::env::temp_dir().join(format!(
+            "lg-hue-sync-unchanged-area-{}-{}.json",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (_, changed) =
+            Config::update_if_changed(&path, Some(saved.clone()), |_| Ok(false)).unwrap();
+        assert!(!changed && !path.exists());
+        let (_, changed) = Config::update_if_changed(&path, Some(saved), |_| Ok(true)).unwrap();
+        assert!(changed && path.exists());
+        let _ = std::fs::remove_file(&path);
+        let mut lock = path.into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
     }
 
     #[test]

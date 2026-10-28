@@ -32,7 +32,13 @@ pub fn discover_bridge_for(expected_id: Option<&str>) -> Result<String> {
     if candidates.is_empty()
         || expected_id.is_some_and(|id| !candidates.iter().any(|c| c.id.eq_ignore_ascii_case(id)))
     {
-        candidates.extend(discover_cloud()?);
+        candidates.extend(discover_cloud().map_err(|error| {
+            if expected_id.is_some() {
+                error
+            } else {
+                error.context("No Hue Bridge found on the local network; enter its IP manually")
+            }
+        })?);
     }
     candidates.sort_by(|a, b| a.id.cmp(&b.id).then(a.ip.cmp(&b.ip)));
     candidates.dedup_by(|a, b| a.id == b.id);
@@ -115,7 +121,7 @@ fn discover_cloud() -> Result<Vec<BridgeCandidate>> {
                 concat!("lg-hue-sync/", env!("CARGO_PKG_VERSION")),
             )
             .call()
-            .context("Hue cloud discovery failed; enter the bridge IP manually")?;
+            .context("Hue cloud discovery failed")?;
         #[derive(Deserialize)]
         struct Entry {
             id: String,
@@ -135,12 +141,14 @@ fn discover_cloud() -> Result<Vec<BridgeCandidate>> {
     // Cache failures too: repeated setup clicks must not exceed the cloud rate limit.
     *cache = Some(CloudCache {
         checked: Instant::now(),
-        result: result
-            .as_ref()
-            .map(Clone::clone)
-            .map_err(ToString::to_string),
+        result: result.as_ref().map(Clone::clone).map_err(error_chain),
     });
     result
+}
+
+/// The cached failure keeps every cause, not only the outer context.
+fn error_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
 }
 
 fn bridge_id(id: &str) -> Option<String> {
@@ -176,5 +184,12 @@ mod tests {
         assert!(select_bridge(&candidates, Some("001788fffe000003")).is_err());
         assert_eq!(bridge_id("001788FFFE000001"), Some(first.id));
         assert!(bridge_id("not-a-bridge-id!!").is_none());
+    }
+
+    #[test]
+    fn cached_cloud_failure_keeps_the_full_error_chain() {
+        let error = anyhow!("dns error").context("Hue cloud discovery failed");
+        let cached = anyhow::Error::msg(error_chain(&error));
+        assert_eq!(cached.to_string(), "Hue cloud discovery failed: dns error");
     }
 }

@@ -741,6 +741,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut last_tv_power_warning = tokio::time::Instant::now() - Duration::from_secs(30);
     let mut last_source_fps_poll = tokio::time::Instant::now();
     let mut hue_retry = RetryState::new();
+    // Each attempt blocks the frame loop for its HTTPS calls, so the cap is longer than DTLS's.
+    let mut bridge_sync_retry = RetryState::with_backoff(Duration::from_secs(1), 5);
     let mut nanoleaf_retry = RetryState::new();
     let mut nanoleaf_only_frame_count = 0u64;
     let mut nanoleaf_only_global = RgbColor::new(0, 0, 0);
@@ -1004,6 +1006,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     );
                     if requested_running == Some(true) {
                         hue_status.blocked = hue_status.needs_refresh;
+                        // A manual Start retries a failed bridge sync at once.
+                        bridge_sync_retry.success();
                     }
                     if hue_active && hue_sync_enabled && !hue_status.blocked {
                         hue_reconnect.request(Some(&config));
@@ -1214,6 +1218,21 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             }
         }
 
+        let hue_wanted = hue_active && hue_sync_enabled && pipeline_state == PipelineState::Running;
+        if !pending_commands.sync_bridge
+            && runtime::bridge_sync_retry_due(
+                hue_status.needs_refresh,
+                hue_wanted,
+                &bridge_sync_retry,
+            )
+        {
+            info!(
+                "Retrying Hue bridge sync (attempt {}).",
+                bridge_sync_retry.failures() + 1
+            );
+            pending_commands.sync_bridge = true;
+        }
+
         if std::mem::take(&mut pending_commands.sync_bridge) && hue_active {
             hue_status.blocked = true;
             hue_status.needs_refresh = true;
@@ -1236,6 +1255,13 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 Ok(area) if !area.zones.is_empty() => {
                     hue_status.blocked = false;
                     hue_status.needs_refresh = false;
+                    if bridge_sync_retry.failures() > 0 {
+                        info!(
+                            "Hue bridge sync recovered after {} failed attempts.",
+                            bridge_sync_retry.failures()
+                        );
+                    }
+                    bridge_sync_retry.success();
                     let configuration_changed = config.entertainment_configuration_id.as_deref()
                         != Some(&area.configuration_id);
                     config.entertainment_area_id = area.configuration_id.clone();
@@ -1277,7 +1303,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         );
                     }
 
-                    if let Err(error) = Config::update(&config_path, None, |current| {
+                    let persisted = Config::update_if_changed(&config_path, None, |current| {
                         if (
                             current.bridge_ip.as_str(),
                             current.username.as_str(),
@@ -1291,6 +1317,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         ) {
                             anyhow::bail!("Hue Bridge configuration changed during sync; retry");
                         }
+                        // An unchanged area must not rewrite config.json on flash.
+                        if current.hue_area() == config.hue_area() {
+                            return Ok(false);
+                        }
                         current.entertainment_area_id = config.entertainment_area_id.clone();
                         current.entertainment_configuration_id =
                             config.entertainment_configuration_id.clone();
@@ -1298,24 +1328,37 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             config.hue_bridge_certificate_sha256.clone();
                         current.hue_bridge_id = config.hue_bridge_id.clone();
                         current.zones = config.zones.clone();
-                        Ok(())
-                    }) {
-                        warn!(
-                            "Hue area sync succeeded but could not persist its certificate pin: {}",
-                            error
-                        );
+                        Ok(true)
+                    });
+                    match persisted {
+                        Ok((_, true)) => info!(
+                            "Synced and persisted {} Hue channel positions from '{}'.",
+                            config.zones.len(),
+                            area.name
+                        ),
+                        Ok((_, false)) => info!(
+                            "Synced {} unchanged Hue channel positions from '{}'.",
+                            config.zones.len(),
+                            area.name
+                        ),
+                        Err(error) => warn!(
+                            "Hue area sync succeeded but could not persist its certificate pin: {error:#}"
+                        ),
                     }
-                    info!(
-                        "Synced and persisted {} Hue channel positions from '{}'.",
-                        config.zones.len(),
+                }
+                Ok(area) => {
+                    let delay = bridge_sync_retry.failure();
+                    warn!(
+                        "Hue area '{}' did not provide channel positions; leaving zones unchanged. Retrying in {delay:?}.",
                         area.name
                     );
                 }
-                Ok(area) => warn!(
-                    "Hue area '{}' did not provide channel positions; leaving zones unchanged.",
-                    area.name
-                ),
-                Err(e) => warn!("Hue bridge sync failed; leaving zones unchanged: {}", e),
+                Err(e) => {
+                    let delay = bridge_sync_retry.failure();
+                    warn!(
+                        "Hue bridge sync failed; leaving zones unchanged: {e:#}. Retrying in {delay:?}."
+                    );
+                }
             }
         }
 

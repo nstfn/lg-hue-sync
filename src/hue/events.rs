@@ -99,6 +99,28 @@ impl HueEventState {
     }
 }
 
+/// Bridge address, identity and application key: a resubscription to another bridge or key
+/// never reuses the previous snapshot.
+type BridgeKey = (Option<String>, String, String);
+
+fn bridge_key(config: &Config) -> BridgeKey {
+    (
+        config.hue_bridge_id.clone(),
+        config.bridge_ip.clone(),
+        config.username.clone(),
+    )
+}
+
+/// Another area, or changed channels or locations, needs a bridge sync; a subscription that
+/// only renews (after a dashboard action, for example) does not.
+fn topology_differs(previous: Option<&Value>, current: &Value) -> bool {
+    previous.is_none_or(|old| {
+        ["id", "channels", "locations"]
+            .into_iter()
+            .any(|key| old.get(key) != current.get(key))
+    })
+}
+
 fn merge(target: &mut Value, patch: &Value) {
     if let (Some(target), Some(patch)) = (target.as_object_mut(), patch.as_object()) {
         for (key, value) in patch {
@@ -116,6 +138,8 @@ struct Pending {
     epoch: u64,
     state: Option<HueEventState>,
     error: Option<anyhow::Error>,
+    /// A topology change that a cancelled subscription published but the daemon never polled.
+    missed_topology: bool,
 }
 
 type Latest = Arc<Mutex<Pending>>;
@@ -145,12 +169,19 @@ impl HueEvents {
             .name("hue-events".into())
             .spawn(move || {
                 let mut pending = None;
+                // The last snapshot survives resubscription to the same bridge, so a renewed
+                // subscription compares with the real previous layout.
+                let mut baseline: Option<(BridgeKey, Value)> = None;
                 while let Some(mut command) = pending.take().or_else(|| receiver.recv().ok()) {
                     for newer in receiver.try_iter() {
                         command = newer;
                     }
                     let (epoch, config) = command;
                     let Some(config) = config else { continue };
+                    let key = bridge_key(&config);
+                    if baseline.as_ref().is_some_and(|(previous, _)| *previous != key) {
+                        baseline = None;
+                    }
                     let mut previous_configuration: Option<Value> = None;
                     let mut retry_delay = Duration::from_secs(2);
                     while current.load(Ordering::SeqCst) == epoch {
@@ -166,14 +197,14 @@ impl HueEvents {
                             if configuration.get("id").and_then(Value::as_str).is_none() {
                                 bail!("Hue configuration snapshot has no resource ID");
                             }
+                            let reference = previous_configuration
+                                .as_ref()
+                                .or(baseline.as_ref().map(|(_, saved)| saved));
+                            let topology_changed = topology_differs(reference, &configuration);
+                            // Ownership is compared within one subscription only: a snapshot
+                            // from before a pause must not report our own restart as a loss.
                             let mut state = HueEventState {
-                                topology_changed: previous_configuration.as_ref().is_none_or(
-                                    |old| {
-                                        old.get("channels") != configuration.get("channels")
-                                            || old.get("locations")
-                                                != configuration.get("locations")
-                                    },
-                                ),
+                                topology_changed,
                                 stream_interrupted: previous_configuration.as_ref().is_some_and(
                                     |old| {
                                         old.get("status").and_then(Value::as_str) == Some("active")
@@ -185,6 +216,7 @@ impl HueEvents {
                                 configuration,
                             };
                             previous_configuration = Some(state.configuration.clone());
+                            baseline = Some((key.clone(), state.configuration.clone()));
                             publish(&output, &current, epoch, Ok(state.clone()));
                             state.topology_changed = false;
                             state.stream_interrupted = false;
@@ -231,52 +263,71 @@ impl HueEvents {
     }
 
     pub fn request(&mut self, config: Option<&Config>) {
-        let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let epoch = {
+            // `publish` checks the generation under this lock: a concurrent result is either
+            // kept below or rejected as missed.
+            let mut latest = self.latest.lock().unwrap();
+            let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let missed_topology = latest.missed_topology
+                || latest.state.as_ref().is_some_and(|state| state.topology_changed);
+            *latest = Pending {
+                missed_topology,
+                ..Pending::default()
+            };
+            epoch
+        };
         if let Some(socket) = self.socket.lock().unwrap().take() {
             let _ = socket.shutdown(Shutdown::Both);
         }
-        *self.latest.lock().unwrap() = Pending::default();
         let _ = self.commands.send((epoch, config.cloned()));
     }
 
     pub fn poll(&mut self) -> Option<Result<HueEventState>> {
-        let mut pending = self.latest.lock().unwrap();
-        if pending.epoch != self.generation.load(Ordering::SeqCst) {
-            return None;
-        }
-        pending
-            .state
-            .take()
-            .map(Ok)
-            .or_else(|| pending.error.take().map(Err))
+        let generation = self.generation.load(Ordering::SeqCst);
+        take_latest(&mut self.latest.lock().unwrap(), generation)
     }
 }
 
+fn take_latest(pending: &mut Pending, generation: u64) -> Option<Result<HueEventState>> {
+    if pending.epoch != generation {
+        return None;
+    }
+    if let Some(mut state) = pending.state.take() {
+        state.topology_changed |= std::mem::take(&mut pending.missed_topology);
+        return Some(Ok(state));
+    }
+    pending.error.take().map(Err)
+}
+
 fn publish(latest: &Latest, generation: &AtomicU64, epoch: u64, result: Result<HueEventState>) {
-    if generation.load(Ordering::SeqCst) == epoch {
-        let mut pending = latest.lock().unwrap();
-        if pending.epoch != epoch {
-            *pending = Pending {
-                epoch,
-                ..Pending::default()
-            };
-        }
-        match result {
-            Ok(mut state) => {
-                if let Some(previous) = pending.state.take() {
-                    state.topology_changed |= previous.topology_changed;
-                    state.stream_interrupted |= previous.stream_interrupted;
-                }
-                pending.state = Some(state);
+    let mut pending = latest.lock().unwrap();
+    if generation.load(Ordering::SeqCst) != epoch {
+        // A topology change from a cancelled subscription must still trigger a bridge sync.
+        pending.missed_topology |= result.is_ok_and(|state| state.topology_changed);
+        return;
+    }
+    if pending.epoch != epoch {
+        *pending = Pending {
+            epoch,
+            missed_topology: pending.missed_topology,
+            ..Pending::default()
+        };
+    }
+    match result {
+        Ok(mut state) => {
+            if let Some(previous) = pending.state.take() {
+                state.topology_changed |= previous.topology_changed;
+                state.stream_interrupted |= previous.stream_interrupted;
             }
-            Err(error) => {
-                if !pending
-                    .error
-                    .as_ref()
-                    .is_some_and(|previous| previous.is::<SessionInvalid>())
-                {
-                    pending.error = Some(error);
-                }
+            pending.state = Some(state);
+        }
+        Err(error) => {
+            if !pending
+                .error
+                .as_ref()
+                .is_some_and(|previous| previous.is::<SessionInvalid>())
+            {
+                pending.error = Some(error);
             }
         }
     }
@@ -570,5 +621,90 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         assert_eq!(server.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn resubscription_compares_with_the_last_snapshot_of_the_same_area() {
+        let snapshot = json!({
+            "id": "area",
+            "status": "active",
+            "channels": [{"channel_id": 0}],
+            "locations": {"service_locations": []}
+        });
+        assert!(topology_differs(None, &snapshot));
+        let mut renewed = snapshot.clone();
+        renewed["status"] = json!("inactive");
+        renewed["metadata"] = json!({"name": "TV"});
+        assert!(!topology_differs(Some(&snapshot), &renewed));
+        for (key, value) in [
+            ("id", json!("other")),
+            ("channels", json!([{"channel_id": 1}])),
+            ("locations", json!({"service_locations": [{"position": {}}]})),
+        ] {
+            let mut changed = snapshot.clone();
+            changed[key] = value;
+            assert!(topology_differs(Some(&snapshot), &changed), "{key}");
+        }
+    }
+
+    #[test]
+    fn topology_change_of_a_cancelled_subscription_reaches_the_next_one() {
+        let latest: Latest = Arc::new(Mutex::new(Pending::default()));
+        let generation = AtomicU64::new(2);
+        let state = |topology_changed| HueEventState {
+            configuration: json!({"id": "area"}),
+            topology_changed,
+            stream_interrupted: false,
+        };
+        publish(&latest, &generation, 1, Ok(state(true)));
+        assert!(latest.lock().unwrap().state.is_none());
+        publish(&latest, &generation, 2, Ok(state(false)));
+        let mut pending = latest.lock().unwrap();
+        assert!(take_latest(&mut pending, 2).unwrap().unwrap().topology_changed);
+        pending.state = Some(state(false));
+        assert!(!take_latest(&mut pending, 2).unwrap().unwrap().topology_changed);
+    }
+
+    #[test]
+    fn renewed_subscription_to_the_same_bridge_does_not_report_topology_changed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut open = Vec::new();
+            for mut stream in listener.incoming().flatten() {
+                let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+                let _ = std::io::Write::write_all(&mut stream, header);
+                open.push(stream);
+            }
+        });
+        let snapshot = Arc::new(Mutex::new(json!({"id": "area", "channels": []})));
+        let source = snapshot.clone();
+        let mut worker = HueEvents::new(
+            move |_| Ok(source.lock().unwrap().clone()),
+            move |_| {
+                let stream = TcpStream::connect(address)?;
+                let cancellation = stream.try_clone()?;
+                Ok(EventConnection::new(Box::new(stream), cancellation))
+            },
+        )
+        .unwrap();
+        let mut next = |config: &Config| {
+            worker.request(Some(config));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(state) = worker.poll() {
+                    break state.unwrap().topology_changed;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let bridge = Config::new_default("192.0.2.1", "user", "", "area");
+        assert!(next(&bridge), "the first snapshot syncs");
+        assert!(!next(&bridge), "a renewed subscription does not");
+        snapshot.lock().unwrap()["channels"] = json!([{"channel_id": 0}]);
+        assert!(next(&bridge), "changed channels sync");
+        let other = Config::new_default("192.0.2.2", "user", "", "area");
+        assert!(next(&other), "another bridge never reuses the snapshot");
     }
 }

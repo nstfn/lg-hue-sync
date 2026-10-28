@@ -163,14 +163,28 @@ pub async fn wait_for_capture_retry(
 pub struct RetryState {
     failures: u32,
     next_attempt: Instant,
+    base: Duration,
+    max_doublings: u32,
 }
 
 impl RetryState {
     pub fn new() -> Self {
+        Self::with_backoff(Duration::from_millis(250), 6)
+    }
+
+    /// The first failure waits `base * 2`; each further failure doubles the delay, up to
+    /// `base * 2^max_doublings`.
+    pub fn with_backoff(base: Duration, max_doublings: u32) -> Self {
         Self {
             failures: 0,
             next_attempt: Instant::now(),
+            base,
+            max_doublings,
         }
+    }
+
+    pub fn failures(&self) -> u32 {
+        self.failures
     }
 
     pub fn ready(&self) -> bool {
@@ -184,10 +198,16 @@ impl RetryState {
 
     pub fn failure(&mut self) -> Duration {
         self.failures = self.failures.saturating_add(1);
-        let delay = Duration::from_millis(250 * (1u64 << self.failures.min(6)));
+        let delay = self.base * (1u32 << self.failures.min(self.max_doublings));
         self.next_attempt = Instant::now() + delay;
         delay
     }
+}
+
+/// A failed bridge sync leaves Hue blocked and no bridge event may follow, so the sync retries
+/// on its own backoff while Hue output is wanted.
+pub fn bridge_sync_retry_due(needs_refresh: bool, hue_wanted: bool, retry: &RetryState) -> bool {
+    needs_refresh && hue_wanted && retry.ready()
 }
 
 #[cfg(test)]
@@ -364,6 +384,23 @@ mod tests {
         retry.success();
         assert!(retry.ready());
         assert_eq!(retry.failure(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn failed_bridge_sync_retries_on_a_capped_backoff_only_while_hue_is_wanted() {
+        let mut retry = RetryState::with_backoff(Duration::from_secs(1), 5);
+        assert!(bridge_sync_retry_due(true, true, &retry));
+        assert!(!bridge_sync_retry_due(false, true, &retry));
+        assert!(!bridge_sync_retry_due(true, false, &retry));
+        let delays: Vec<_> = (0..7).map(|_| retry.failure().as_secs()).collect();
+        assert_eq!(delays, [2, 4, 8, 16, 32, 32, 32]);
+        assert_eq!(retry.failures(), 7);
+        // No tight loop: a failure defers the next attempt.
+        assert!(!bridge_sync_retry_due(true, true, &retry));
+        retry.success();
+        assert_eq!(retry.failures(), 0);
+        assert!(bridge_sync_retry_due(true, true, &retry));
+        assert!(!bridge_sync_retry_due(true, false, &retry));
     }
 
     #[test]

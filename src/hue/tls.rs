@@ -31,7 +31,8 @@ pub fn connect_bridge_tls(bridge_ip: &str, trust: BridgeTrust<'_>) -> Result<Ssl
                 return Err(error).context("Failed to connect to Hue Bridge HTTPS endpoint");
             };
             // Rediscovery is only for an unreachable address, never a TLS or authorization failure.
-            let discovered = super::discovery::discover_bridge_for(Some(id))?;
+            let discovered = super::discovery::discover_bridge_for(Some(id))
+                .map_err(|cause| unreachable_bridge(bridge_ip, error, cause))?;
             let address: IpAddr = discovered
                 .parse()
                 .context("Invalid discovered Hue address")?;
@@ -54,6 +55,17 @@ pub fn connect_bridge_tls(bridge_ip: &str, trust: BridgeTrust<'_>) -> Result<Ssl
     let fingerprint = peer_certificate_sha256(&stream)?;
     check_identity(&id, &fingerprint, trust)?;
     Ok(stream)
+}
+
+/// Keeps the TCP failure as the root cause: rediscovery is only the fallback that also failed.
+fn unreachable_bridge(
+    bridge_ip: &str,
+    connect: std::io::Error,
+    rediscovery: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(connect).context(format!(
+        "Hue Bridge rediscovery failed ({rediscovery:#}) after the configured bridge IP {bridge_ip} was unreachable on port 443"
+    ))
 }
 
 fn bridge_roots() -> Result<X509Store> {
@@ -189,5 +201,19 @@ mod tests {
         )
         .is_err());
         assert!(check_identity("not-a-bridge-id!!", &pin, BridgeTrust::default()).is_err());
+    }
+
+    #[test]
+    fn unreachable_configured_bridge_keeps_the_tcp_error_as_root_cause() {
+        use std::io::{Error as IoError, ErrorKind};
+        let connect = IoError::new(ErrorKind::TimedOut, "connection timed out");
+        let rediscovery = anyhow!("request failed").context("Hue cloud discovery failed");
+        let error = unreachable_bridge("192.0.2.1", connect, rediscovery);
+        let root = error.root_cause().downcast_ref::<IoError>().unwrap();
+        assert_eq!(root.kind(), ErrorKind::TimedOut);
+        let message = format!("{error:#}");
+        assert!(message.contains("bridge IP 192.0.2.1 was unreachable"));
+        assert!(message.contains("Hue cloud discovery failed: request failed"));
+        assert!(message.ends_with(": connection timed out"), "{message}");
     }
 }
