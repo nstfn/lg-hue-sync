@@ -282,7 +282,7 @@ Si `nr_throttled` grimpe vite et que le fps baisse, monter `CPUQuota=` (par exem
 Tout le disque devient en lecture seule pour le démon, sauf `state/`. `/tmp` devient privé.
 
 ```sh
-systemctl show $U -p ProtectSystem -p ReadWritePaths -p PrivateTmp -p UMask -p ProtectProc
+systemctl show $U -p ProtectSystem -p ReadWritePaths -p UMask -p ProtectProc
 systemd-run --wait --pipe -p ProtectSystem=strict -p ReadWritePaths=$D/state /bin/sh -c \
   "touch $D/probe; touch $D/state/probe && rm $D/state/probe && echo ok"
 # Attendu : « Read-only file system » pour $D/probe, puis « ok ».
@@ -483,3 +483,21 @@ for R in /var/luna-service2 /var/luna-service2-dev; do cp -p $R/roles.d/org.webo
 - **`MemoryHigh=` est sans effet** sur cgroups v1. Seule la limite dure `MemoryMax=` agit.
 - **journald ne garde rien** : les messages de systemd sur une unité en échec sont perdus. On se fie à `systemctl show -p Result -p ExecMainStatus` et à `state/daemon.log`.
 - **Couches 30, 40 et 60** : une partie dépend de seccomp. Sans `+SECCOMP` dans `systemctl --version`, systemd ignore ces réglages en silence.
+- **Relevé sur la G4 le 2026-10-29 : `-SECCOMP` et `-BPF_FRAMEWORK`.** La couche 60 n'y a donc aucun effet : ne pas l'installer.
+  Dans les couches 30 et 40, `RestrictRealtime`, `LockPersonality`, `RestrictSUIDSGID`, `RestrictNamespaces` et la partie seccomp de `ProtectClock` sont ignorés.
+  Ce qui agit vraiment :
+  - `ProtectSystem=strict` avec `state/` pour seul dossier inscriptible ;
+  - `NoNewPrivileges` et l'ensemble vide de capacités ;
+  - les protections du noyau par montages ;
+  - la liste de périphériques (cgroup v1) ;
+  - les limites de processeur et de mémoire ;
+  - le chien de garde.
+- **Pas de `PrivateTmp`** : sur cette TV, `/var/run` est un lien vers `/tmp/var/run`, et le socket Luna (`com.palm.hub`) vit donc sous `/tmp`.
+  Avec un `/tmp` privé, `luna-send` échoue (« Unable to connect to com.palm.hub »), et libvtcapture s'arrête sur « LSRegister FAILED ».
+  `/tmp` reste en lecture seule pour le démon, par `ProtectSystem=strict`.
+- **Résultat du 2026-10-29** (couches 10, 20, 30, 40, 50 et 70 posées, binaire `nstfn-1.0.0-7`) :
+  - `systemd-analyze security` passe de 9,5 (« UNSAFE ») à 4,4 (« OK ») ;
+  - `CapEff` et `CapBnd` sont à 0, et `NoNewPrivs` à 1 ;
+  - une écriture hors de `state/` est refusée (« Read-only file system ») ;
+  - la mémoire est plafonnée à 96 Mo (`memory.limit_in_bytes`), et le processeur à 60 % (`cfs_quota_us` 60000) ;
+  - capture, Hue et Luna fonctionnent.
