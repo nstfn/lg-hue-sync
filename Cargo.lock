@@ -672,6 +672,8 @@ dependencies = [
  "axum",
  "byteorder",
  "clap",
+ "hyper",
+ "hyper-util",
  "libc",
  "libloading",
  "mdns-sd",

@@ -92,8 +92,19 @@ fi
 # 4. Package and deploy webOS Application to Home Dashboard ribbon
 if [ -n "$IPK_PATH" ]; then
     echo "[*] Installing packaged webOS application for Home Dashboard..."
-    scp $SCP_OPTS "$IPK_PATH" root@"$TV_IP":"/tmp/org.webosbrew.lg-hue-sync.ipk"
-    ssh $SSH_OPTS root@"$TV_IP" "luna-send -n 1 -f luna://com.webos.appInstallService/dev/install '{\"id\":\"org.webosbrew.lg-hue-sync\", \"ipkUrl\":\"/tmp/org.webosbrew.lg-hue-sync.ipk\", \"subscribe\":false}' || true"
+    # A fresh mktemp directory, not a fixed /tmp name another local user could plant first.
+    # Mode 755: the install service must read it; only root can write in it.
+    IPK_DIR="$(ssh $SSH_OPTS root@"$TV_IP" 'd=$(mktemp -d /tmp/lg-hue-sync-ipk.XXXXXX) && chmod 755 "$d" && echo "$d"')"
+    case "$IPK_DIR" in
+        /tmp/lg-hue-sync-ipk.*) ;;
+        *) echo "[-] Could not create a temporary IPK directory on the TV." >&2; exit 1 ;;
+    esac
+    REMOTE_IPK="$IPK_DIR/org.webosbrew.lg-hue-sync.ipk"
+    scp $SCP_OPTS "$IPK_PATH" root@"$TV_IP":"$REMOTE_IPK"
+    ssh $SSH_OPTS root@"$TV_IP" "luna-send -n 1 -f luna://com.webos.appInstallService/dev/install '{\"id\":\"org.webosbrew.lg-hue-sync\", \"ipkUrl\":\"$REMOTE_IPK\", \"subscribe\":false}' || true"
+    # The install runs on after luna-send returns (subscribe:false), so the package is
+    # removed after a delay, detached from this SSH session.
+    ssh $SSH_OPTS root@"$TV_IP" "nohup sh -c 'sleep 120; rm -rf \"$IPK_DIR\"' </dev/null >/dev/null 2>&1 &"
 fi
 
 # 5. Write the systemd unit and the webosbrew init.d boot hook (no start yet).

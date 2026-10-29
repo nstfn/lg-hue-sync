@@ -21,6 +21,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 thiserror = "2.0"
 axum = { version = "0.8", features = ["json"] }
+# Already in the tree through axum; used directly for the HTTP/1 header-read timeout.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service"] }
 byteorder = "1.5"
 ureq = { version = "3", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"] }
