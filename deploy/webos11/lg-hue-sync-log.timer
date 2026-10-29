@@ -1,0 +1,10 @@
+# Runs lg-hue-sync-log.service every minute. Started by the boot hook
+# /var/lib/webosbrew/init.d/55-lg-hue-sync-log (no [Install] section needed).
+
+[Unit]
+Description=Check LG sync log size every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
