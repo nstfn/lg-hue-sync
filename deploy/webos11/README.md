@@ -193,7 +193,7 @@ systemctl is-active lg-hue-sync-log.timer
 ```
 
 Puis les **contrôles communs**, dont l'extinction en veille.
-Vérifier aussi que « Redémarrer » dans l'interface web laisse le service actif : avec `Restart=on-failure`, une sortie propre ne relance plus le démon.
+Vérifier aussi que « Redémarrer » dans l'interface web laisse le service actif. L'unité garde `Restart=always` : après un appairage Hue ou Nanoleaf, le démon s'arrête volontairement avec un code de succès et compte sur systemd pour le relancer. La limite de démarrages (10 en 30 minutes) arrête quand même une boucle de plantages.
 
 **Retour arrière** (une ligne) :
 
