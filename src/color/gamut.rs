@@ -126,11 +126,10 @@ fn distance_squared(a: Point, b: Point) -> f64 {
     dx * dx + dy * dy
 }
 
-/// Converts sRGB (0..255) to CIE 1931 xy coordinates and brightness, clamped to Hue Gamut C.
-pub fn rgb_to_xy_brightness(r: u8, g: u8, b: u8, gamut: HueGamut) -> HueXYBrightness {
-    let r_norm = r as f64 / 255.0;
-    let g_norm = g as f64 / 255.0;
-    let b_norm = b as f64 / 255.0;
+/// Converts encoded sRGB (0.0..255.0, fractional) to CIE 1931 xy and brightness, clamped to the gamut.
+pub fn rgb_to_xy_brightness(r: f32, g: f32, b: f32, gamut: HueGamut) -> HueXYBrightness {
+    let normalize = |value: f32| (f64::from(value) / 255.0).clamp(0.0, 1.0);
+    let (r_norm, g_norm, b_norm) = (normalize(r), normalize(g), normalize(b));
 
     // Decode sRGB without changing the Hue-specific XYZ matrix below.
     let linear = palette::Srgb::new(r_norm, g_norm, b_norm).into_linear();
@@ -179,7 +178,7 @@ mod tests {
                 (10, 11, 12),
                 (128, 64, 200),
             ] {
-                let output = rgb_to_xy_brightness(r, g, b, gamut);
+                let output = rgb_to_xy_brightness(r.into(), g.into(), b.into(), gamut);
                 for value in [output.x, output.y, output.brightness] {
                     assert!(value.is_finite() && (0.0..=1.0).contains(&value));
                 }
