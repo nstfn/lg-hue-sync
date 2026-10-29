@@ -23,7 +23,10 @@ ExecStart=/var/home/root/lg-hue-sync/lg-hue-sync run --config /var/home/root/lg-
 # journald stores nothing on this TV, and log-maintenance.sh bounds the file.
 StandardOutput=append:/var/home/root/lg-hue-sync/state/daemon.log
 StandardError=inherit
-Restart=on-failure
+# Restart=always, not on-failure: after Hue or Nanoleaf pairing, the daemon exits 0
+# on purpose ("restarting daemon to load the new configuration", src/main.rs) and
+# relies on systemd to start it again. The start limit above still stops a crash loop.
+Restart=always
 RestartSec=10
 # SIGTERM at shutdown runs `systemctl is-system-running` (1 s) and then Hue
 # lights-off (about 7 s worst case). 10 s covers both.
