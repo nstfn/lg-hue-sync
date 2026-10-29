@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -36,10 +37,21 @@ pub fn pair_nanoleaf(ip: &str, timeout_secs: u64) -> Result<(String, u16, Vec<u1
     println!(">>> for 5-7 seconds until the status LED starts blinking!");
     println!("========================================================\n");
 
-    pair_nanoleaf_at(
-        &format!("http://{ip}:16021"),
-        Duration::from_secs(timeout_secs),
-    )
+    pair_nanoleaf_at(&device_base_url(ip)?, Duration::from_secs(timeout_secs))
+}
+
+/// Nanoleaf tokens are pasted into URL paths, so only ASCII letters and digits are accepted.
+pub fn valid_auth_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// `SocketAddr` brackets IPv6, so an address never corrupts the URL authority.
+fn device_base_url(ip: &str) -> Result<String> {
+    let ip: IpAddr = ip
+        .trim()
+        .parse()
+        .with_context(|| format!("Invalid Nanoleaf IP address: {ip}"))?;
+    Ok(format!("http://{}", SocketAddr::new(ip, 16021)))
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -66,6 +78,9 @@ fn pair_nanoleaf_at(base_url: &str, timeout: Duration) -> Result<(String, u16, V
             Ok(r) => {
                 if let Ok(json) = r.into_body().read_json::<Value>() {
                     if let Some(token) = json.get("auth_token").and_then(|v| v.as_str()) {
+                        if !valid_auth_token(token) {
+                            return Err(anyhow!("Nanoleaf returned an invalid auth token"));
+                        }
                         auth_token = token.to_string();
                         println!("\n[+] Successfully paired with Nanoleaf controller!");
                         break;
@@ -122,6 +137,9 @@ pub fn get_panel_layout(
     auth_token: &str,
     timeout: Duration,
 ) -> Result<PanelLayout> {
+    if !valid_auth_token(auth_token) {
+        return Err(anyhow!("Invalid Nanoleaf auth token"));
+    }
     let url = format!("{base_url}/api/v1/{auth_token}/panelLayout/layout");
     let resp = crate::local_http::agent(Some(timeout))
         .get(&url)
@@ -140,7 +158,10 @@ pub fn get_panel_layout(
 /// Activates external control mode (UDP v2 streaming) on the Nanoleaf device.
 /// Returns the UDP port to stream to (typically 60222).
 pub fn enable_external_control(ip: &str, auth_token: &str) -> Result<u16> {
-    let url = format!("http://{}:16021/api/v1/{}/effects", ip, auth_token);
+    if !valid_auth_token(auth_token) {
+        return Err(anyhow!("Invalid Nanoleaf auth token"));
+    }
+    let url = format!("{}/api/v1/{auth_token}/effects", device_base_url(ip)?);
     let payload = serde_json::json!({
         "write": {
             "command": "display",
@@ -178,6 +199,24 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    #[test]
+    fn tokens_and_addresses_are_checked_before_they_reach_a_url() {
+        assert!(valid_auth_token("AbC123xyz"));
+        for token in ["", "abc/def", "abc?x=1", "abc def", "tök", "a.b"] {
+            assert!(!valid_auth_token(token), "{token:?} accepted");
+        }
+        assert_eq!(
+            device_base_url(" 192.168.1.20 ").unwrap(),
+            "http://192.168.1.20:16021"
+        );
+        assert_eq!(
+            device_base_url("fe80::1").unwrap(),
+            "http://[fe80::1]:16021"
+        );
+        assert!(device_base_url("192.168.1.20/evil").is_err());
+        assert!(enable_external_control("192.168.1.20", "bad/token").is_err());
+    }
 
     fn stalled_server(
         responses: Vec<&'static [u8]>,

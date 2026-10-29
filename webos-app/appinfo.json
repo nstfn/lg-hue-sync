@@ -11,7 +11,5 @@
   "resolution": "1920x1080",
   "uiRevision": "2",
   "appDescription": "Philips Hue & Nanoleaf Ambient Lighting Controller",
-  "requiredPermissions": [
-    "all"
-  ]
+  "requiredPermissions": []
 }
