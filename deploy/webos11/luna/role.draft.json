@@ -1,0 +1,41 @@
+{
+    "exeName": "/var/home/root/lg-hue-sync/lg-hue-sync",
+    "type": "privileged",
+    "allowedNames": [
+        "com.webos.service.capture.client*",
+        "com.webos.rm.client.*",
+        "org.webosbrew.lg-hue-sync*"
+    ],
+    "permissions": [
+        {
+            "service": "com.webos.service.capture.client*",
+            "outbound": [
+                "com.webos.service.capture",
+                "com.webos.service.capturepermission",
+                "__OUTBOUND_FROM_LS_MONITOR__"
+            ],
+            "inbound": [
+                "com.webos.service.capture",
+                "__INBOUND_FROM_LS_MONITOR__"
+            ]
+        },
+        {
+            "service": "com.webos.rm.client.*",
+            "outbound": [
+                "__OUTBOUND_FROM_LS_MONITOR__"
+            ],
+            "inbound": [
+                "__INBOUND_FROM_LS_MONITOR__"
+            ]
+        },
+        {
+            "service": "org.webosbrew.lg-hue-sync*",
+            "outbound": [
+                "__OUTBOUND_FROM_LS_MONITOR__"
+            ],
+            "inbound": [
+                "__INBOUND_FROM_LS_MONITOR__"
+            ]
+        }
+    ]
+}

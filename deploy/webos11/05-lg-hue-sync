@@ -1,0 +1,39 @@
+#!/bin/sh
+# Homebrew Channel boot hook for lg-hue-sync (webOS 11 layout with state/).
+# Install as /var/lib/webosbrew/init.d/05-lg-hue-sync, mode 755.
+# - touch /var/home/root/lg-hue-sync/DISABLE to skip the start at boot.
+# - The unit and every lg-hue-sync.service.d/*.conf drop-in are copied to
+#   /run/systemd/system (tmpfs). A drop-in removed from the install directory
+#   disappears from /run at the next run of this hook.
+# - Run it by hand after a change, then `systemctl restart lg-hue-sync`:
+#   `--no-block start` does not restart a running service.
+# POSIX sh only: the TV runs busybox ash.
+set -eu
+
+D=/var/home/root/lg-hue-sync
+U=lg-hue-sync.service
+R=/run/systemd/system
+
+[ ! -e "$D/DISABLE" ] || exit 0
+[ -x "$D/lg-hue-sync" ] || exit 0
+[ -f "$D/$U" ] || exit 0
+
+# state/ is the only path the daemon can write. ReadWritePaths= fails the start
+# when it is missing, so create it (owner only) when it does not exist.
+if [ ! -d "$D/state" ]; then
+    mkdir -m 700 "$D/state"
+fi
+
+mkdir -p "$R"
+cp "$D/$U" "$R/$U"
+rm -rf "$R/$U.d"
+if [ -d "$D/$U.d" ]; then
+    mkdir -p "$R/$U.d"
+    for f in "$D/$U.d"/*.conf; do
+        [ -f "$f" ] || continue
+        cp "$f" "$R/$U.d/"
+    done
+fi
+
+systemctl daemon-reload
+systemctl --no-block start "$U"

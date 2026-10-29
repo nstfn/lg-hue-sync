@@ -1,0 +1,12 @@
+{
+    "com.webos.service.capture.client*": [
+        "__GROUP_FOR_com.webos.service.capture__",
+        "__GROUP_FOR_com.webos.service.capturepermission__"
+    ],
+    "com.webos.rm.client.*": [
+        "__GROUP_FOR_RM_SERVICE_FROM_LS_MONITOR__"
+    ],
+    "org.webosbrew.lg-hue-sync*": [
+        "__GROUP_FROM_LS_MONITOR__"
+    ]
+}

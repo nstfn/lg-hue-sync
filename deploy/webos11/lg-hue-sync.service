@@ -1,0 +1,33 @@
+# lg-hue-sync on LG webOS 11 (OLED G4, systemd 255, cgroup v1).
+# Root-owned files (this unit, its drop-ins, the binary, the scripts) stay in
+# /var/home/root/lg-hue-sync. The daemon writes only to state/: config.json,
+# config.json.lock, config.new-<pid>-<n> and daemon.log. The drop-ins in
+# lg-hue-sync.service.d/ make state/ the only writable path.
+# The boot hook /var/lib/webosbrew/init.d/05-lg-hue-sync copies this file and
+# its drop-in directory to /run/systemd/system at each boot.
+
+[Unit]
+Description=LG Hue Sync daemon
+After=network.target
+Conflicts=sleep.target suspend.target
+# Stop a crash loop: after 10 starts in 30 minutes, the unit stays failed.
+# Recover with: systemctl reset-failed lg-hue-sync && systemctl start lg-hue-sync
+StartLimitIntervalSec=30min
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/var/home/root/lg-hue-sync/state
+ExecStart=/var/home/root/lg-hue-sync/lg-hue-sync run --config /var/home/root/lg-hue-sync/state/config.json
+# PID 1 opens the log file, so the daemon needs no path access to it.
+# journald stores nothing on this TV, and log-maintenance.sh bounds the file.
+StandardOutput=append:/var/home/root/lg-hue-sync/state/daemon.log
+StandardError=inherit
+Restart=on-failure
+RestartSec=10
+# SIGTERM at shutdown runs `systemctl is-system-running` (1 s) and then Hue
+# lights-off (about 7 s worst case). 10 s covers both.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# Truncates state/daemon.log at 1 MiB. Started every minute by
+# lg-hue-sync-log.timer. Installed to /run/systemd/system by the existing boot
+# hook /var/lib/webosbrew/init.d/55-lg-hue-sync-log.
+# This unit runs as root on a file inside the daemon-writable state/. The
+# script refuses a symlink, but a swap between its check and the truncation
+# is possible. ProtectSystem=strict with ReadWritePaths=state/ keeps any such
+# truncation inside state/. PrivateDevices= and ProtectKernelTunables= stop a
+# swap toward a device node, /proc/sys or /sys.
+
+[Unit]
+Description=Clear LG sync log at 1 MiB
+ConditionPathIsDirectory=/var/home/root/lg-hue-sync/state
+
+[Service]
+Type=oneshot
+ExecStart=/var/home/root/lg-hue-sync/log-maintenance.sh /var/home/root/lg-hue-sync/state/daemon.log
+ProtectSystem=strict
+ReadWritePaths=/var/home/root/lg-hue-sync/state
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
