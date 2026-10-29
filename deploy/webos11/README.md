@@ -2,7 +2,8 @@
 
 Ce dossier prépare un déploiement « au moindre privilège » pour une seule TV :
 LG OLED G4, webOS 11.2.0, noyau 6.12, ARMv7, rootée, systemd 255, cgroups v1.
-Rien ici n'est encore appliqué à la TV. On déroule les étapes une par une, dans l'ordre.
+Sur la G4, les étapes 0 à 3 sont appliquées depuis le 2026-10-30, sauf la couche 60 (pas de seccomp sur ce noyau).
+On déroule les étapes une par une, dans l'ordre.
 
 ## Le problème à corriger (P0)
 
@@ -25,7 +26,7 @@ La correction :
 | `05-lg-hue-sync` | `/var/lib/webosbrew/init.d/` | Script de démarrage (Homebrew Channel) |
 | `lg-hue-sync-log.service`, `.timer` | `/var/home/root/lg-hue-sync/` | Vidage du journal à 1 Mio, chaque minute |
 | `log-maintenance.sh` | `/var/home/root/lg-hue-sync/` | Script de vidage, chemin `state/daemon.log` |
-| `luna/*.draft.json` | (brouillons) | Droits Luna réduits, à compléter à l'étape 3 |
+| `luna/role.json`, `luna/client-permissions.json` | `/var/luna-service2{,-dev}/roles.d/` et `client-permissions.d/` | Droits Luna minimaux (étape 3) |
 
 Le script de démarrage `55-lg-hue-sync-log` existant ne change pas.
 Il copie déjà `lg-hue-sync-log.service` et `.timer` depuis le dossier d'installation.
@@ -372,69 +373,87 @@ Si le test passe, copier `70-watchdog.conf` dans `$D/lg-hue-sync.service.d/`, re
 
 ## Étape 3 : réduire les droits Luna
 
+Appliquée sur la G4 le 2026-10-30, avec le binaire `nstfn-1.0.0-7`.
 Risque : le plus élevé. Une erreur coupe la capture, mais pas le reste de la TV.
 Les requêtes de veille et d'état (tvpower, applicationManager, tv.display, videooutput, arccontroller) passent par `luna-send`.
 `luna-send` a son propre rôle : cette étape ne les touche pas.
 
 ### 3a. Relever les noms et méthodes réellement utilisés par la capture
 
-TV allumée sur une image, synchro active.
+TV allumée sur une image, synchro active. Sur la G4, 30 s de relevé font environ 600 lignes (300 Ko).
 
 ```sh
-ls-monitor --help 2>&1 | head -40      # confirmer les options sur ce webOS
+P=$(systemctl show -p MainPID --value lg-hue-sync)
+ls-monitor -l 2>&1 | awk -v p=$P '$1==p'      # noms tenus par le démon, sans le relancer
 systemctl stop lg-hue-sync
-ls-monitor > /tmp/lhs-lsmon.txt 2>&1 &
-M=$!
+(ls-monitor -j > /tmp/lhs-mon.json 2>&1 &)
 sleep 2
 systemctl start lg-hue-sync
 sleep 30
-kill $M
-P=$(systemctl show -p MainPID --value lg-hue-sync); echo "PID=$P"
-head -40 /tmp/lhs-lsmon.txt            # lire le format des lignes
-grep -E 'com\.webos\.service\.capture|com\.webos\.rm|org\.webosbrew\.lg-hue-sync' /tmp/lhs-lsmon.txt > /tmp/lhs-lsmon-capture.txt
-wc -l /tmp/lhs-lsmon-capture.txt
-grep -oE '(com\.webos|org\.webosbrew)[A-Za-z0-9._*-]*' /tmp/lhs-lsmon-capture.txt | sort | uniq -c | sort -rn
-grep -oE '/[A-Za-z0-9_]+(/[A-Za-z0-9_]+)*' /tmp/lhs-lsmon-capture.txt | sort | uniq -c | sort -rn | head -40
+killall ls-monitor
+P=$(systemctl show -p MainPID --value lg-hue-sync)
+U=$(ls-monitor -l 2>&1 | awk -v p=$P '$1==p{print $NF}' | paste -sd'|')   # noms uniques du démon
+grep -E "$U" /tmp/lhs-mon.json | cut -c1-300
 ```
 
-Si `--help` montre une option de liste des clients (souvent `-l`), la lancer et chercher le PID du démon :
+Chaque ligne est un objet JSON : `sender`, `destination`, `method`, `type` (`call`, `return`, `callCancel`), `payload`.
+Un même message apparaît deux fois : en émission (`TX`) et en réception (`RX`).
+
+**Relevé sur la G4 (2026-10-30)** :
+
+- Le démon tient deux noms : `com.webos.service.capture.client<n>` (« client only ») et `com.webos.rm.client._<id>`.
+  Il n'enregistre jamais `org.webosbrew.lg-hue-sync` : cette chaîne est seulement l'identifiant passé à `vtCapture_init`.
+- Le client de ressources appelle `com.webos.media` : `registerPipeline`, `subscribe`, `acquire` (ressource `VT_CAPTURE`), `acquireComplete`.
+- Le client de capture appelle `com.webos.service.capturepermission/checkPermission`, avec abonnement.
+  Il n'appelle jamais `com.webos.service.capture`.
+- Aucun autre service n'appelle le démon.
+
+### 3b. Trouver les groupes de permissions et un modèle chez LG
 
 ```sh
-ls-monitor -l 2>&1 | grep -E " $P |lg-hue-sync"
+cd /usr/share/luna-service2
+grep -l -E 'com.webos.media/|capturepermission' api-permissions.d/*
+grep -l -E 'capture.client|rm.client' roles.d/* client-permissions.d/*
+cat roles.d/com.webos.service.lightingcontroller.role.json
+grep -n -E 'capture.client|rm.client' client-permissions.d/*
 ```
 
-Noter pour la suite :
+**Relevé sur la G4** :
 
-- les noms enregistrés par le démon (par exemple `com.webos.service.capture.client…`, `com.webos.rm.client…`, `org.webosbrew.lg-hue-sync…`) ;
-- pour chaque nom, les services appelés (sortants) et les services qui le rappellent (entrants) ;
-- chaque méthode appelée, sous la forme `service/catégorie/méthode`.
+- Les méthodes de `com.webos.media` vues en 3a sont dans les groupes `media` (174 méthodes) et `private`.
+  `checkPermission` est dans `capturepermission.security` (2 méthodes) et `private`.
+  `acquireComplete` n'est dans aucun groupe.
+- LG donne déjà des groupes à ces noms, pour tout le système :
+  `com.webos.service.capture.client*` a `all` (`com.webos.service.capture.perm.json`),
+  et `com.webos.rm.client._*` a `private` (`compat.perm.json`).
+- Le service d'éclairage d'ambiance de LG, `com.webos.service.lightingcontroller`, capture l'image comme le démon.
+  Son rôle est de type `regular`. Il autorise seulement ses noms, et son client de ressources ne parle qu'à `com.webos.media`.
+  Il n'ajoute aucun groupe à ses noms clients.
+- Le hub charge les fichiers listés par `/var/luna-service2*/manifests.d/org.webosbrew.lg-hue-sync.json`, par leur chemin exact.
 
-Pour voir aussi la reprise après veille, refaire la capture en mettant la TV en veille puis en la rallumant pendant les 30 secondes.
+### 3c. Les fichiers
 
-### 3b. Trouver les groupes de permissions
-
-```sh
-ls /usr/share/luna-service2/api-permissions.d/
-grep -lE 'com\.webos\.service\.capture|com\.webos\.service\.capturepermission' /usr/share/luna-service2/api-permissions.d/*
-```
-
-Ouvrir ces fichiers. Pour chaque méthode notée en 3a, noter le nom du groupe qui la contient.
-Faire de même pour le service de ressources vu en 3a (`com.webos.rm…` ou `com.webos.media…`).
-Lire aussi `/usr/share/luna-service2/groups.d/` s'il existe : il peut lier les groupes à des niveaux de confiance.
-
-### 3c. Remplir les brouillons
-
-La session principale complète, dans le dépôt :
-
-- `luna/role.draft.json` : remplacer chaque `__OUTBOUND_FROM_LS_MONITOR__` et `__INBOUND_FROM_LS_MONITOR__` par les services vus en 3a. Retirer un bloc entier si son nom n'apparaît pas en 3a.
-- `luna/client-permissions.draft.json` : remplacer chaque `__GROUP_…__` par les groupes trouvés en 3b. Jamais `all`.
-
-Elle enregistre le résultat sous `luna/role.json` et `luna/client-permissions.json`, puis le recopie dans `$S/luna/` sur la TV.
+- `luna/role.json` reprend le modèle du service d'éclairage de LG :
+  - deux noms autorisés, type `regular` ;
+  - le client de capture envoie seulement à `capturepermission` et à `capture` (marge : `libvtcapture` contient ce nom) ;
+  - le client de ressources ne parle qu'à `com.webos.media`, dans les deux sens.
+- `luna/client-permissions.json` est un objet vide : le démon garde les groupes de LG et n'en ajoute aucun.
+  L'ancien fichier ajoutait `all` à ces noms pour tout le système, donc aussi aux applications de LG.
+- Le manifeste ne change pas.
 
 ### 3d. Installer
 
+Copier `luna/role.json` et `luna/client-permissions.json` dans `$S/luna/` sur la TV.
+Les sauvegardes vont hors des dossiers du hub : une ancienne version large ne reste jamais à côté du vrai fichier.
+
 ```sh
-grep -c '__' $S/luna/role.json $S/luna/client-permissions.json   # doit afficher 0 pour les deux
+B=$D/luna-backup-$J
+for R in luna-service2 luna-service2-dev; do
+    mkdir -p $B/$R
+    for K in roles.d client-permissions.d manifests.d; do
+        cp -p /var/$R/$K/org.webosbrew.lg-hue-sync.json $B/$R/$K.org.webosbrew.lg-hue-sync.json
+    done
+done
 for R in /var/luna-service2 /var/luna-service2-dev; do
     cp $S/luna/role.json $R/roles.d/org.webosbrew.lg-hue-sync.json
     cp $S/luna/client-permissions.json $R/client-permissions.d/org.webosbrew.lg-hue-sync.json
@@ -443,18 +462,25 @@ ls-control scan-services
 systemctl restart lg-hue-sync
 ```
 
-**Contrôles** : tous les **contrôles communs**, surtout la capture, puis une veille et un réveil.
-Si la TV garde un journal système (par exemple `/var/log/messages`), y chercher un refus Luna :
+**Contrôles** : tous les **contrôles communs**, surtout la capture, puis `ls-monitor -l` (les deux noms seulement), puis une veille et un réveil.
+Pour prouver que le hub applique le fichier, faire un essai négatif : retirer `com.webos.media` des sorties du client de ressources, puis relancer.
+La capture doit échouer (`vtCapture_init` rend 11 après 30 s). Remettre ensuite `luna/role.json`.
 
-```sh
-[ -f /var/log/messages ] && grep -iE 'lg-hue-sync|capture' /var/log/messages | grep -iE 'denied|permission|not allowed' | tail -20
-```
+**Résultat sur la G4 (2026-10-30)**, un changement à la fois (rôle réduit, puis groupes retirés, puis type `regular`) :
+
+- à chaque essai : capture matérielle à 30 images/s, Hue connecté, `NRestarts=0`, aucune erreur ;
+- essai négatif : aucun message du client de ressources n'atteint le bus, et la capture échoue, donc le hub applique le fichier ;
+- veille : bandeau éteint 1,75 s après la veille ; réveil : flux Hue rétabli en 2 s ;
+- arrêt pendant un `vtCapture_init` bloqué : 8,4 s, sous la limite de 10 s (`TimeoutStopSec`). Ce blocage n'arrive pas en marche normale.
 
 **Retour arrière** (une ligne) :
 
 ```sh
-for R in /var/luna-service2 /var/luna-service2-dev; do cp -p $R/roles.d/org.webosbrew.lg-hue-sync.json.bak-$J $R/roles.d/org.webosbrew.lg-hue-sync.json; cp -p $R/client-permissions.d/org.webosbrew.lg-hue-sync.json.bak-$J $R/client-permissions.d/org.webosbrew.lg-hue-sync.json; done; ls-control scan-services; systemctl restart lg-hue-sync
+for R in luna-service2 luna-service2-dev; do cp -p $B/$R/roles.d.org.webosbrew.lg-hue-sync.json /var/$R/roles.d/org.webosbrew.lg-hue-sync.json; cp -p $B/$R/client-permissions.d.org.webosbrew.lg-hue-sync.json /var/$R/client-permissions.d/org.webosbrew.lg-hue-sync.json; done; ls-control scan-services; systemctl restart lg-hue-sync
 ```
+
+**Attention** : `scripts/deploy.sh` et `make provision` lancent `scripts/provision_luna.sh`, qui remet les droits larges.
+Après l'un d'eux, refaire 3d.
 
 ## En cas de gros pépin
 
@@ -470,7 +496,8 @@ for R in /var/luna-service2 /var/luna-service2-dev; do cp -p $R/roles.d/org.webo
 - **Périphériques** : seulement la capture vidéo (couches 40 et 50).
 - **Appels système** : seulement ceux d'un service ordinaire ; pas de mémoire à la fois inscriptible et exécutable (couche 60).
 - **Ressources** : un démon en boucle ou qui fuit ne peut pas prendre toute la TV (couche 10). Une boucle de plantages s'arrête après 10 essais.
-- **Luna** : le démon ne peut plus se faire passer pour le service de capture lui-même (étape 3).
+- **Luna** : le démon ne peut plus se faire passer pour le service de capture ni pour celui des permissions de capture.
+  Ses deux noms ne parlent qu'aux services de capture et de médias de LG, sans groupe ajouté (étape 3).
 - **Vidage du journal** : l'unité root qui vide `daemon.log` ne peut écrire que dans `state/`. Un lien symbolique posé par le démon ne la mène pas ailleurs.
 
 ## Limites connues

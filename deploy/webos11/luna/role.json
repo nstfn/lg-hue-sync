@@ -1,0 +1,26 @@
+{
+    "exeName": "/var/home/root/lg-hue-sync/lg-hue-sync",
+    "type": "regular",
+    "allowedNames": [
+        "com.webos.service.capture.client*",
+        "com.webos.rm.client.*"
+    ],
+    "permissions": [
+        {
+            "service": "com.webos.service.capture.client*",
+            "outbound": [
+                "com.webos.service.capturepermission",
+                "com.webos.service.capture"
+            ]
+        },
+        {
+            "service": "com.webos.rm.client.*",
+            "inbound": [
+                "com.webos.media"
+            ],
+            "outbound": [
+                "com.webos.media"
+            ]
+        }
+    ]
+}
