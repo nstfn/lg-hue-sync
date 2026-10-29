@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -15,12 +15,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
+          toolchain: 1.99.1
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest@0.9.146
       - run: python3 scripts/check_release.py
@@ -34,20 +35,25 @@ jobs:
   webos-target:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - run: make build-docker
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pin the image toolchain; the Makefile default (stable) serves local refreshes.
+      - run: make build-docker RUST_VERSION=1.99.1
       - name: Verify ARMv7 Linux artifact
         run: file target/armv7-unknown-linux-gnueabi/release/lg-hue-sync | grep -q 'ELF 32-bit.*ARM'
-      # Fork: keep the ARMv7 binary on every run, not only on tags, to deploy a patched build.
+      # Fork: keep the ARMv7 binary on push and manual runs, not only on tags, to deploy a
+      # patched build. Pull requests get no artifact.
       - name: Stage release binary
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
           mkdir -p release
           cp target/armv7-unknown-linux-gnueabi/release/lg-hue-sync release/lg-hue-sync-armv7
           sha256sum release/lg-hue-sync-armv7 > release/SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         with:
           name: webos-armv7-release
           path: release/
+          retention-days: 14
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -56,9 +62,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3 scripts/check_release.py --tag "${GITHUB_REF_NAME}"
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: webos-armv7-release
           path: release

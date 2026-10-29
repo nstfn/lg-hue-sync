@@ -1,6 +1,10 @@
-FROM debian:buster
+# Pinned by digest: the buster manifest list, resolved from Docker Hub on 2026-10-29.
+FROM debian:buster@sha256:58ce6f1271ae1c8a2006ff7d3e54e9874d839f573d8009c20154ad0f2fb0a225
 
-ARG RUST_VERSION=stable
+ARG RUST_VERSION=1.99.1
+ARG RUSTUP_VERSION=1.29.2
+# Published value of rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init.sha256.
+ARG RUSTUP_INIT_SHA256=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4
 ENV RUSTUP_HOME=/opt/rust/rustup \
     CARGO_HOME=/cargo-cache \
     PATH=/opt/rust/cargo/bin:${PATH} \
@@ -10,20 +14,34 @@ ENV RUSTUP_HOME=/opt/rust/rustup \
     AR_armv7_unknown_linux_gnueabi=arm-linux-gnueabi-ar \
     RANLIB_armv7_unknown_linux_gnueabi=arm-linux-gnueabi-ranlib
 
+# Buster is archived: apt verifies every Release signature against the image's
+# debian-archive-keyring; only Valid-Until is skipped because archived suites expire.
+# The image ships no CA bundle, so ca-certificates comes first over signed HTTP,
+# then every other package comes over HTTPS.
 RUN printf '%s\n' \
-      'deb [trusted=yes] http://archive.debian.org/debian buster main' \
-      'deb [trusted=yes] http://archive.debian.org/debian-security buster/updates main' \
+      'deb http://archive.debian.org/debian buster main' \
+      'deb http://archive.debian.org/debian-security buster/updates main' \
       > /etc/apt/sources.list \
     && apt-get -o Acquire::Check-Valid-Until=false update -qq \
-    && apt-get install --allow-unauthenticated -y -qq \
+    && apt-get install -y -qq ca-certificates \
+    && printf '%s\n' \
+      'deb https://archive.debian.org/debian buster main' \
+      'deb https://archive.debian.org/debian-security buster/updates main' \
+      > /etc/apt/sources.list \
+    && apt-get -o Acquire::Check-Valid-Until=false update -qq \
+    && apt-get install -y -qq \
       build-essential gcc-arm-linux-gnueabi libc6-dev-armel-cross \
       binutils-arm-linux-gnueabi make perl curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /opt/rust/cargo /opt/rust/rustup /cargo-cache /target-cache \
-    && CARGO_HOME=/opt/rust/cargo curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | CARGO_HOME=/opt/rust/cargo sh -s -- -y --no-modify-path \
+    && curl --proto '=https' --tlsv1.2 -fsSo /tmp/rustup-init \
+      "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+    && echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && CARGO_HOME=/opt/rust/cargo /tmp/rustup-init -y --no-modify-path \
         --default-toolchain "${RUST_VERSION}" --profile minimal \
-        --target armv7-unknown-linux-gnueabi
+        --target armv7-unknown-linux-gnueabi \
+    && rm /tmp/rustup-init
 
 WORKDIR /app
 
