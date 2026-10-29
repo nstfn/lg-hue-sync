@@ -1429,6 +1429,17 @@
         ? selected + (data.preset_modified ? ' · Modified. Save to keep changes.' : ' · Saved/default settings.')
         : 'Choose a style, then adjust it. Save keeps changes; Reset restores factory settings.');
     }
+    // These statuses carry an actionable JSON `error` from the server (busy, size, host, rate, timeout).
+    const SERVER_MESSAGE_STATUSES = new Set([409, 413, 421, 429, 503, 504]);
+    async function requestError(res, label) {
+      if (SERVER_MESSAGE_STATUSES.has(res.status)) {
+        try {
+          const body = await res.json();
+          if (typeof body?.error === 'string' && body.error) return new Error(body.error);
+        } catch (_) {}
+      }
+      return new Error(label + ' request failed: ' + res.status);
+    }
     function showPresetNotice(text) {
       presetNotice = { text, until: Date.now() + 5000 };
       updatePresetUI(lastStatus);
@@ -1439,7 +1450,7 @@
       updatePresetUI(lastStatus);
       try {
         const res = await fetch('/api/presets/' + encodeURIComponent(name), { method: 'POST' });
-        if (!res.ok) throw new Error('Style request failed: ' + res.status);
+        if (!res.ok) throw await requestError(res, 'Style');
         await pollStatus();
         showPresetNotice('Style recalled.');
       } catch (error) {
@@ -1456,7 +1467,7 @@
       updatePresetUI(lastStatus);
       try {
         const res = await fetch('/api/presets/' + encodeURIComponent(name) + '/reset', { method: 'POST' });
-        if (!res.ok) throw new Error('Reset request failed: ' + res.status);
+        if (!res.ok) throw await requestError(res, 'Reset');
         await pollStatus();
         showPresetNotice('Factory settings applied. Save to keep them.');
       } catch (error) {
@@ -1505,7 +1516,7 @@
       updatePresetUI(lastStatus);
       try {
         const res = await fetch('/api/save-config', { method: 'POST' });
-        if (!res.ok) throw new Error('Save request failed: ' + res.status);
+        if (!res.ok) throw await requestError(res, 'Save');
         await pollStatus();
         showPresetNotice('Settings saved to the TV.');
       } catch (error) {

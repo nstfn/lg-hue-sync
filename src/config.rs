@@ -111,7 +111,7 @@ impl LightZone {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NanoleafConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -162,6 +162,24 @@ pub enum TvOffLights {
     Restore,
 }
 
+const REDACTED: &str = "<redacted>";
+
+// Credentials must never reach logs or panic messages through `{:?}`.
+impl std::fmt::Debug for NanoleafConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NanoleafConfig")
+            .field("enabled", &self.enabled)
+            .field("ip", &self.ip)
+            .field("auth_token", &format_args!("{REDACTED}"))
+            .field("udp_port", &self.udp_port)
+            .field("segments", &self.segments)
+            .field("panel_ids", &self.panel_ids)
+            .field("alignment", &self.alignment)
+            .finish()
+    }
+}
+
 fn default_nanoleaf_port() -> u16 {
     60222
 }
@@ -188,7 +206,7 @@ pub struct PresetTuning {
     pub hdr_tone_mapping: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub active_preset: Option<String>,
@@ -533,6 +551,34 @@ impl Config {
         Ok((config, changed))
     }
 
+    /// Removes `save_unlocked` temporary files that a killed writer left next to the config.
+    /// Writers hold the config lock while their temporary file exists, so this takes it too.
+    pub fn remove_stale_temp_files<P: AsRef<Path>>(path: P) -> Result<usize, ConfigError> {
+        let path = path.as_ref();
+        let _process_lock = CONFIG_WRITE_MUTEX.lock().map_err(|_| ConfigError::Lock {
+            path: path.to_path_buf(),
+            source: std::io::Error::other("config write mutex poisoned"),
+        })?;
+        let _file_lock = lock_config(path)?;
+        let dir = config_dir(path);
+        let entries = fs::read_dir(dir).map_err(|source| ConfigError::Open {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // Only regular files: a planted symlink or directory is left alone.
+            let regular = fs::symlink_metadata(entry.path()).is_ok_and(|meta| meta.is_file());
+            if regular && is_temp_file_name(path, &name) && fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     fn save_unlocked(&self, path: &Path) -> Result<(), ConfigError> {
         self.validate_capture_dimensions(path)?;
         let temp_path = path.with_extension(format!(
@@ -571,12 +617,55 @@ impl Config {
             fs::rename(&temp_path, path).map_err(|source| ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
-            })
+            })?;
+            // The rename is durable only once the directory entry itself reaches the flash.
+            let dir = config_dir(path);
+            File::open(dir)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|source| ConfigError::Write {
+                    path: dir.to_path_buf(),
+                    source,
+                })
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp_path);
         }
         result
+    }
+}
+
+// The serialised form lists every field, including future ones; only the credentials are masked.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut value = serde_json::to_value(self).map_err(|_| std::fmt::Error)?;
+        for pointer in ["/username", "/clientkey", "/nanoleaf/auth_token"] {
+            if let Some(secret) = value.pointer_mut(pointer) {
+                *secret = REDACTED.into();
+            }
+        }
+        write!(formatter, "Config {value}")
+    }
+}
+
+/// Matches `save_unlocked` temporary names: `<stem>.new-<pid>-<counter>`.
+fn is_temp_file_name(config_path: &Path, name: &str) -> bool {
+    let Some(stem) = config_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    name.strip_prefix(stem)
+        .and_then(|rest| rest.strip_prefix(".new-"))
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(pid, counter)| {
+            [pid, counter]
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+}
+
+fn config_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
 }
 
@@ -629,6 +718,69 @@ fn lock_config(path: &Path) -> Result<File, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_hue_and_nanoleaf_credentials() {
+        let mut config = Config::new_default(
+            "192.0.2.10",
+            "fixture-application-key",
+            "fixture-client-key",
+            "area",
+        );
+        config.nanoleaf = Some(NanoleafConfig {
+            enabled: true,
+            ip: "192.0.2.20".into(),
+            auth_token: "fixtureNanoleafToken".into(),
+            udp_port: 60222,
+            segments: 30,
+            panel_ids: vec![1, 2],
+            alignment: NanoleafAlignment::default(),
+        });
+        let debug = format!("{config:?}");
+        for secret in [
+            "fixture-application-key",
+            "fixture-client-key",
+            "fixtureNanoleafToken",
+        ] {
+            assert!(!debug.contains(secret), "{secret} leaked in {debug}");
+        }
+        assert!(debug.contains("192.0.2.10") && debug.contains("192.0.2.20"));
+        assert_eq!(debug.matches(REDACTED).count(), 3);
+        let nanoleaf = format!("{:?}", config.nanoleaf.unwrap());
+        assert!(!nanoleaf.contains("fixtureNanoleafToken") && nanoleaf.contains(REDACTED));
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_stale_config_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "lg-hue-sync-temp-cleanup-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        Config::update(&path, Some(Config::new_default("", "", "", "")), |_| Ok(())).unwrap();
+        let stale = ["config.new-123-0", "config.new-4567-89"];
+        let kept = [
+            "config.new-abc-1",
+            "config.new-12",
+            "config.new--1",
+            "other.new-1-2",
+            "config.json.bak",
+        ];
+        for name in stale.iter().chain(&kept) {
+            fs::write(dir.join(name), b"{}").unwrap();
+        }
+        fs::create_dir(dir.join("config.new-9-9")).unwrap();
+        assert_eq!(Config::remove_stale_temp_files(&path).unwrap(), stale.len());
+        for name in stale {
+            assert!(!dir.join(name).exists(), "{name} survived");
+        }
+        for name in kept.iter().chain(&["config.json", "config.new-9-9"]) {
+            assert!(dir.join(name).exists(), "{name} was removed");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn tv_off_lights_defaults_to_off_and_accepts_restore() {

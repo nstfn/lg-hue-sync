@@ -17,8 +17,10 @@ pub struct HueReconnect<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> HueReconnect<T> {
+    /// `connect` writes the address it resolved into the config, so every later `stop` of that
+    /// session (failure, replacement or shutdown) targets the bridge that was really started.
     pub fn new(
-        connect: impl Fn(&Config) -> Result<T> + Send + 'static,
+        connect: impl Fn(&mut Config) -> Result<T> + Send + 'static,
         stop: impl Fn(&Config) -> Result<()> + Send + 'static,
     ) -> Result<Self> {
         let (commands, receiver) = mpsc::channel::<(u64, Option<Config>)>();
@@ -41,14 +43,14 @@ impl<T: Send + 'static> HueReconnect<T> {
                         }
                     }
                     let (epoch, config) = command;
-                    let Some(config) = config else {
+                    let Some(mut config) = config else {
                         completed.store(epoch, Ordering::SeqCst);
                         continue;
                     };
                     if current.load(Ordering::SeqCst) != epoch {
                         continue;
                     }
-                    let result = connect(&config);
+                    let result = connect(&mut config);
                     if result.is_err() || current.load(Ordering::SeqCst) != epoch {
                         if let Err(error) = stop(&config) {
                             warn!("Failed to deactivate unsuccessful Hue session: {error:#}");
@@ -243,5 +245,38 @@ mod tests {
         worker.request(Some(&config("area")));
         assert_eq!(result(&mut worker).unwrap(), "connected");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn stop_uses_the_address_that_connect_resolved() {
+        let (stopped, stopped_rx) = mpsc::channel();
+        let mut worker = HueReconnect::new(
+            move |config| {
+                config.bridge_ip = "192.0.2.9".into();
+                if config.entertainment_area_id == "fails" {
+                    anyhow::bail!("start failed");
+                }
+                Ok(config.entertainment_area_id.clone())
+            },
+            move |config| {
+                stopped.send(config.bridge_ip.clone()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        worker.request(Some(&config("ok")));
+        assert_eq!(result(&mut worker).unwrap(), "ok");
+        // Replacing the session stops the old one at its resolved address.
+        worker.request(Some(&config("fails")));
+        assert_eq!(
+            stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "192.0.2.9"
+        );
+        assert!(result(&mut worker).is_err());
+        // A failed start is cleaned up at the address it reached as well.
+        assert_eq!(
+            stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "192.0.2.9"
+        );
     }
 }

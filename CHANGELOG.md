@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Let a scene cut move 4 times the normal step, so a full black-to-white cut takes about 6 frames instead of 22. It stays under the flash-safety limit.
 - Keep fractional colours through the Hue output trim and convert them straight to 16 bits. Rounding to 8 bits first made dark fades step unevenly.
 - Weight sampled pixels by chroma (max - min) instead of (max - min) / max, so near-black noise such as (3, 0, 1) weighs like grey instead of like pure red.
+- Keep light updates flowing while the TV is queried. The TV power, foreground source and source frame-rate queries each took up to 1.5 s inside the frame loop, so every 2 s light updates could stall for up to 4.5 s. One background task now runs them every 2 s and publishes each round; the running and paused loops only read the newest round, without waiting. Power-change handling, the standby lights-off trigger, the source policy and the retry of a faulted capture after a TV wake or an HDMI switch are unchanged.
+- Log the real cause of a pause (TV standby, capture fault, unsupported source, manual stop) instead of `web=true` for every stop.
+- Show the server's message in the dashboard for a 409, 413, 421, 429, 503 or 504 answer to Save, a style recall or a style reset, instead of only the status code.
+- Subscribe to Hue events again when the bridge address, bridge ID, certificate pin, application key or Entertainment area changes. The worker kept the configuration it got at the first request.
+- Stop a Hue Entertainment session at the bridge address that the reconnect verified, not at the saved one.
+- Keep the daemon running when the Nanoleaf controller is unreachable at startup. It logs the error and runs Hue alone; the next resume or Nanoleaf sync toggle retries Nanoleaf.
+- Make a `config.json` save durable: the config directory is synced after the rename. At startup, remove `config.new-*` temporary files left by a killed writer.
+- Log an idle Hue event stream read timeout (EAGAIN, "os error 11", or TimedOut) at info level as a reconnect, not as "Hue events unavailable". The reconnect is unchanged.
 
 ### Security
 - Remove the legacy DILE_VT capture backend. It mapped physical addresses returned by the driver through `/dev/mem`, read-write, with no range check, and its structure layout dated from webOS 6. libvtcapture is now the only native backend: a failed or busy init keeps no capture and retries on the existing capture backoff.
@@ -33,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound the HTTP API: JSON bodies are limited to 16 KiB (128 KiB for `POST /api/preview/render`, sized from its largest valid frame), at most 16 requests run at once (503 beyond), and each request times out after 10 s (504), 60 s for pairing and Hue area routes. Pairing and Hue area operations run one at a time; another one gets 409.
 - Refuse DNS rebinding and cross-site requests. A Host other than an IP literal, `localhost` or `lg-hue-sync.local` (each with an optional port) gets 421. A POST, PUT, PATCH or DELETE whose Origin header does not match the Host gets 403; requests without Origin, such as Home Assistant, curl and Shortcuts, are unchanged.
 - Limit flash writes of `config.json`. A save whose serialised bytes equal the file on disk is skipped. `POST /api/save-config` and `POST /api/bonjour` save at most once every 10 s; a request inside that window gets 429 and live settings stay applied.
+- Redact the Hue application key, the Hue client key and the Nanoleaf auth token from `Debug` output of the configuration.
+- Accept only a private (RFC 1918) or link-local IPv4 address for Nanoleaf pairing from the dashboard. Accept a Nanoleaf auth token only when it holds ASCII letters and digits, and build Nanoleaf addresses through `SocketAddr`, so an IPv6 address is always bracketed.
+- Request no webOS permissions for the launcher app (`requiredPermissions: []`). It only opens the local dashboard.
 
 ## [1.0.0] - 2026-10-29
 

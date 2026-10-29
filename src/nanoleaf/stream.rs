@@ -26,14 +26,12 @@ impl NanoleafUdpStreamer {
             .context("Failed to bind UDP socket for Nanoleaf streaming")?;
         socket.set_nonblocking(true)?;
 
-        let target_addr: SocketAddr = format!("{}:{}", target_ip, target_port)
-            .parse()
-            .with_context(|| {
-                format!(
-                    "Invalid Nanoleaf target address: {}:{}",
-                    target_ip, target_port
-                )
-            })?;
+        // `SocketAddr::new` accepts IPv6 too, where "ip:port" text would need brackets.
+        let target_addr = target_ip
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map(|ip| SocketAddr::new(ip, target_port))
+            .with_context(|| format!("Invalid Nanoleaf target address: {target_ip}"))?;
 
         socket.connect(target_addr)?;
 

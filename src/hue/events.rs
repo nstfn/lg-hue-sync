@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tracing::info;
 
 const MAX_LINE: usize = 16 * 1024;
 const MAX_EVENT: usize = 64 * 1024;
@@ -197,6 +198,7 @@ impl HueEvents {
                     let mut previous_configuration: Option<Value> = None;
                     let mut retry_delay = Duration::from_secs(2);
                     while current.load(Ordering::SeqCst) == epoch {
+                        let mut idle = false;
                         let result = (|| -> Result<()> {
                             // Subscribe before the snapshot so updates during GET remain queued.
                             let connection = connect(&config)?;
@@ -233,7 +235,9 @@ impl HueEvents {
                             state.topology_changed = false;
                             state.stream_interrupted = false;
                             while current.load(Ordering::SeqCst) == epoch {
-                                let event = reader.next_event()?;
+                                let event = reader
+                                    .next_event()
+                                    .inspect_err(|error| idle = is_idle_timeout(error))?;
                                 retry_delay = Duration::from_secs(2);
                                 if state.apply(&event)? {
                                     previous_configuration = Some(state.configuration.clone());
@@ -247,8 +251,13 @@ impl HueEvents {
                         if let Some(socket) = active_socket.lock().unwrap().take() {
                             let _ = socket.shutdown(Shutdown::Both);
                         }
-                        if let Err(error) = result {
-                            publish(&output, &current, epoch, Err(error));
+                        match result {
+                            // Same reconnect path as a failure, but nothing failed: no warning.
+                            Err(_) if idle => {
+                                info!("Hue event stream idle past its read timeout; reconnecting.")
+                            }
+                            Err(error) => publish(&output, &current, epoch, Err(error)),
+                            Ok(()) => {}
                         }
                         if current.load(Ordering::SeqCst) != epoch {
                             break;
@@ -364,6 +373,20 @@ impl Drop for HueEvents {
             let _ = worker.join();
         }
     }
+}
+
+/// The read timeout fires on a quiet subscription as EAGAIN/WouldBlock ("os error 11") or
+/// TimedOut, depending on the platform: an idle stream, not a bridge failure.
+fn is_idle_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        })
 }
 
 fn line(reader: &mut impl BufRead, max: usize) -> Result<Vec<u8>> {
@@ -515,6 +538,26 @@ impl EventReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_read_timeouts_are_told_apart_from_stream_failures() {
+        use std::io::{Error, ErrorKind};
+        for idle in [
+            anyhow::Error::from(Error::from_raw_os_error(libc::EAGAIN)),
+            anyhow::Error::from(Error::from(ErrorKind::WouldBlock)),
+            anyhow::Error::from(Error::from(ErrorKind::TimedOut)).context("Hue event read"),
+        ] {
+            assert!(is_idle_timeout(&idle), "{idle:#}");
+        }
+        for failure in [
+            anyhow!("Hue event stream disconnected"),
+            anyhow::Error::from(Error::from(ErrorKind::ConnectionReset)),
+            anyhow::Error::from(Error::from(ErrorKind::UnexpectedEof)),
+            SessionInvalid("Hue authorization revoked").into(),
+        ] {
+            assert!(!is_idle_timeout(&failure), "{failure:#}");
+        }
+    }
     use serde_json::json;
 
     #[test]

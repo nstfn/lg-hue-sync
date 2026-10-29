@@ -321,9 +321,126 @@ pub fn tv_off_second_pass_due(
     mode == TvOffLights::Off && hue_sync_enabled && tv_active == Some(false) && !our_stream
 }
 
+/// Running loop: what one TV power observation decides. Returns whether the power changed
+/// (logged), and the run request it queues: only on a change, with no request already queued
+/// and no manual Stop. A first observation counts as a change only for standby while running.
+pub fn tv_power_run_request(
+    previous: Option<bool>,
+    active: bool,
+    running: bool,
+    queued: Option<bool>,
+    manually_stopped: bool,
+) -> (bool, Option<bool>) {
+    let changed = previous
+        .map(|previous| previous != active)
+        .unwrap_or(!active && running);
+    let request = (changed && queued.is_none() && !manually_stopped).then_some(active);
+    (changed, request)
+}
+
+/// Paused loop: only a seen standby-to-active wake starts sync, never over a queued request or
+/// a manual Stop.
+pub fn tv_wake_starts(
+    previous: Option<bool>,
+    active: bool,
+    requested: Option<bool>,
+    manually_stopped: bool,
+) -> bool {
+    requested.is_none() && !manually_stopped && previous == Some(false) && active
+}
+
+/// The reason logged when the loop enters its paused state; the first match wins.
+pub fn pause_cause(
+    capture_faulted: bool,
+    source_blocked: bool,
+    manually_stopped: bool,
+    tv_standby: bool,
+    stop_requested: bool,
+) -> &'static str {
+    if capture_faulted {
+        "capture fault"
+    } else if source_blocked {
+        "unsupported source"
+    } else if manually_stopped {
+        "manual stop"
+    } else if tv_standby {
+        "TV standby"
+    } else if stop_requested {
+        "stop request"
+    } else {
+        "already paused"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tv_power_observations_decide_run_requests_like_the_inline_poll() {
+        // Running: a first standby observation stops sync; a first active one changes nothing.
+        assert_eq!(
+            tv_power_run_request(None, false, true, None, false),
+            (true, Some(false))
+        );
+        assert_eq!(
+            tv_power_run_request(None, true, true, None, false),
+            (false, None)
+        );
+        assert_eq!(
+            tv_power_run_request(None, false, false, None, false),
+            (false, None)
+        );
+        // Steady states do not re-request; transitions do.
+        assert_eq!(
+            tv_power_run_request(Some(true), true, true, None, false),
+            (false, None)
+        );
+        assert_eq!(
+            tv_power_run_request(Some(true), false, true, None, false),
+            (true, Some(false))
+        );
+        assert_eq!(
+            tv_power_run_request(Some(false), true, true, None, false),
+            (true, Some(true))
+        );
+        // A queued request or a manual Stop wins; the change is still logged.
+        assert_eq!(
+            tv_power_run_request(Some(true), false, true, Some(true), false),
+            (true, None)
+        );
+        assert_eq!(
+            tv_power_run_request(Some(true), false, true, None, true),
+            (true, None)
+        );
+
+        // Paused: only a seen standby-to-active wake starts sync.
+        assert!(tv_wake_starts(Some(false), true, None, false));
+        assert!(!tv_wake_starts(None, true, None, false));
+        assert!(!tv_wake_starts(Some(true), true, None, false));
+        assert!(!tv_wake_starts(Some(false), false, None, false));
+        assert!(!tv_wake_starts(Some(false), true, Some(false), false));
+        assert!(!tv_wake_starts(Some(false), true, None, true));
+    }
+
+    #[test]
+    fn pause_log_names_the_real_cause() {
+        assert_eq!(pause_cause(true, true, true, true, true), "capture fault");
+        assert_eq!(
+            pause_cause(false, true, false, true, true),
+            "unsupported source"
+        );
+        assert_eq!(pause_cause(false, false, true, true, true), "manual stop");
+        assert_eq!(pause_cause(false, false, false, true, true), "TV standby");
+        assert_eq!(
+            pause_cause(false, false, false, false, true),
+            "stop request"
+        );
+        assert_eq!(
+            pause_cause(false, false, false, false, false),
+            "already paused"
+        );
+    }
 
     #[test]
     fn only_a_system_shutdown_or_a_known_standby_counts_as_tv_off_at_sigterm() {

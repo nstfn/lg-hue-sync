@@ -6,6 +6,7 @@ mod hue;
 mod local_http;
 mod luna;
 mod nanoleaf;
+mod observer;
 mod runtime;
 mod setup;
 mod tv_power;
@@ -33,6 +34,7 @@ use hue::{
     reconnect::HueReconnect, sync_entertainment_areas, HueDtlsClient, HueStreamPacketBuilder,
 };
 use nanoleaf::{NanoleafPerimeterSampler, NanoleafUdpStreamer};
+use observer::PowerObservation;
 use runtime::{CaptureSourcePolicy, ExternalState, PendingCommands, PipelineState, RetryState};
 use setup::{run_pair, run_pair_nanoleaf, run_sync_hue};
 use web::{start_web_server, CalibrationPattern, LiveSettings, SharedState, SyncState};
@@ -122,12 +124,13 @@ struct ConnectedHue {
     bridge_ip: String,
 }
 
-fn reconnect_hue(config: &Config) -> Result<ConnectedHue> {
+/// Writes the verified bridge address into `config`, so the reconnect worker stops this
+/// session at the bridge it started, not at a stale saved address.
+fn reconnect_hue(config: &mut Config) -> Result<ConnectedHue> {
     let verified = hue::connect_bridge_tls(&config.bridge_ip, config.hue_trust())?;
-    let mut resolved = config.clone();
-    resolved.bridge_ip = verified.get_ref().peer_addr()?.ip().to_string();
+    config.bridge_ip = verified.get_ref().peer_addr()?.ip().to_string();
     drop(verified);
-    let config = &resolved;
+    let config = &*config;
     set_hue_stream_active(config, true)?;
     let application_id =
         hue::fetch_application_id(&config.bridge_ip, &config.username, config.hue_trust())?;
@@ -158,9 +161,29 @@ fn set_hue_stream_active(config: &Config, active: bool) -> Result<()> {
     )
 }
 
+/// What a Hue event subscription was opened with. A new address, trust (bridge ID or
+/// certificate pin), key or area needs a new subscription: the worker keeps its config copy.
+type HueEventSubscription = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn hue_event_subscription(config: &Config) -> HueEventSubscription {
+    (
+        config.bridge_ip.clone(),
+        config.username.clone(),
+        config.hue_bridge_id.clone(),
+        config.hue_bridge_certificate_sha256.clone(),
+        hue_configuration_id(config),
+    )
+}
+
 struct HueStatus {
     events: hue::events::HueEvents,
-    enabled: bool,
+    subscription: Option<HueEventSubscription>,
     blocked: bool,
     needs_refresh: bool,
 }
@@ -200,17 +223,18 @@ impl HueStatus {
         )?;
         Ok(Self {
             events,
-            enabled: false,
+            subscription: None,
             blocked: false,
             needs_refresh: false,
         })
     }
 
     fn request(&mut self, config: Option<&Config>) {
-        if self.enabled == config.is_some() {
+        let subscription = config.map(hue_event_subscription);
+        if self.subscription == subscription {
             return;
         }
-        self.enabled = config.is_some();
+        self.subscription = subscription;
         self.events.request(config);
     }
 }
@@ -379,6 +403,12 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
+    // A writer killed between create and rename leaves `config.new-*` behind; nothing else does.
+    match Config::remove_stale_temp_files(&config_path) {
+        Ok(0) => {}
+        Ok(removed) => info!("Removed {removed} stale temporary config file(s)."),
+        Err(error) => warn!("Could not clean stale temporary config files: {error}"),
+    }
 
     let hue_active =
         config.hue_enabled && !config.bridge_ip.is_empty() && !config.username.is_empty();
@@ -588,14 +618,25 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             n_cfg.alignment,
         );
         let streamer = if nanoleaf_sync_enabled && pipeline_should_run {
-            let port = nanoleaf::enable_external_control(&n_cfg.ip, &n_cfg.auth_token)?;
-            let streamer = NanoleafUdpStreamer::new(&n_cfg.ip, port, sampler.panel_ids())?;
-            info!(
-                "[+] Nanoleaf 4D streaming ready: {} perimeter segments on UDP port {}",
-                streamer.panel_count(),
-                port
-            );
-            Some(streamer)
+            // An unreachable controller must not stop the daemon (and Hue). As on resume,
+            // Nanoleaf stays off until the next resume or Nanoleaf sync toggle retries it.
+            match nanoleaf::enable_external_control(&n_cfg.ip, &n_cfg.auth_token).and_then(|port| {
+                NanoleafUdpStreamer::new(&n_cfg.ip, port, sampler.panel_ids())
+                    .map(|streamer| (port, streamer))
+            }) {
+                Ok((port, streamer)) => {
+                    info!(
+                        "[+] Nanoleaf 4D streaming ready: {} perimeter segments on UDP port {}",
+                        streamer.panel_count(),
+                        port
+                    );
+                    Some(streamer)
+                }
+                Err(error) => {
+                    error!("Nanoleaf unavailable at startup; continuing without it: {error:#}");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -756,9 +797,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     }
     let mut capture_recovery = CaptureRecovery::default();
     let mut capture_faulted = false;
-    let mut last_tv_power_poll = tokio::time::Instant::now() - Duration::from_secs(2);
     let mut last_tv_power_warning = tokio::time::Instant::now() - Duration::from_secs(30);
-    let mut last_source_fps_poll = tokio::time::Instant::now();
     let mut hue_retry = RetryState::new();
     // Each attempt blocks the frame loop for its HTTPS calls, so the cap is longer than DTLS's.
     let mut bridge_sync_retry = RetryState::with_backoff(Duration::from_secs(1), 5);
@@ -770,12 +809,21 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         desired_running: (!pipeline_should_run).then_some(false),
         ..PendingCommands::default()
     };
-    let mut last_source_poll = tokio::time::Instant::now() - Duration::from_secs(2);
     let mut pipeline_state = if pipeline_should_run {
         PipelineState::Running
     } else {
         PipelineState::Paused
     };
+    // Luna queries run on their own task every 2 s; both loops below only take the newest
+    // round, so a slow `luna-send` never stalls light updates.
+    let mut luna = observer::LunaObserver::spawn(
+        observer::LunaQueries::tv(),
+        observer::POLL_PERIOD,
+        auto_tv_power,
+        config.fps == 0 && pipeline_state == PipelineState::Running,
+    );
+    // Start of the last direct source query: an older background round must not undo it.
+    let mut last_direct_source: Option<tokio::time::Instant> = None;
 
     'sync_loop: while running.load(Ordering::SeqCst) {
         pending_commands.receive(&mut command_rx);
@@ -785,49 +833,54 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
 
         watchdog.tick();
 
-        if last_source_poll.elapsed() >= Duration::from_secs(2) {
-            last_source_poll = tokio::time::Instant::now();
-            source_policy.observe(crate::capture_source::current_source().await.compatible());
+        luna.set_source_fps(config.fps == 0 && pipeline_state == PipelineState::Running);
+        let observed = luna.take();
+        if let Some(source) = observed
+            .as_ref()
+            .and_then(|round| round.source_since(last_direct_source))
+        {
+            source_policy.observe(source);
         }
 
-        if auto_tv_power && last_tv_power_poll.elapsed() >= Duration::from_secs(2) {
-            last_tv_power_poll = tokio::time::Instant::now();
-            match tv_power::is_active().await {
-                Ok(state @ Some(_)) => {
+        if auto_tv_power {
+            match observed.as_ref().and_then(|round| round.power.clone()) {
+                Some(PowerObservation::State(state @ Some(active))) => {
                     shared_state.set_tv_power_state(state);
-                    let active = state.unwrap();
-                    let changed = observed_tv_power
-                        .map(|previous| previous != active)
-                        .unwrap_or(!active && pipeline_state == PipelineState::Running);
+                    let (changed, request) = runtime::tv_power_run_request(
+                        observed_tv_power,
+                        active,
+                        pipeline_state == PipelineState::Running,
+                        pending_commands.desired_running,
+                        source_policy.manually_stopped(),
+                    );
                     if changed {
                         info!(
                             "TV power changed: {}",
                             if active { "active" } else { "standby" }
                         );
-                        if pending_commands.desired_running.is_none()
-                            && !source_policy.manually_stopped()
-                        {
-                            pending_commands.desired_running = Some(active);
-                            if runtime::tv_off_lights_due(
-                                tv_off_lights,
-                                hue_active && hue_sync_enabled,
-                                hue_dtls.is_some() && !hue_status.blocked,
-                                !active,
-                            ) {
-                                tv_off_lights_pending = Some(tokio::time::Instant::now());
-                            }
+                    }
+                    if let Some(request) = request {
+                        pending_commands.desired_running = Some(request);
+                        if runtime::tv_off_lights_due(
+                            tv_off_lights,
+                            hue_active && hue_sync_enabled,
+                            hue_dtls.is_some() && !hue_status.blocked,
+                            !request,
+                        ) {
+                            tv_off_lights_pending = Some(tokio::time::Instant::now());
                         }
                     }
                     observed_tv_power = Some(active);
                 }
-                Ok(None) => shared_state.set_tv_power_state(None),
-                Err(error) => {
+                Some(PowerObservation::State(None)) => shared_state.set_tv_power_state(None),
+                Some(PowerObservation::Unavailable(error)) => {
                     shared_state.set_tv_power_state(None);
                     if last_tv_power_warning.elapsed() >= Duration::from_secs(30) {
                         warn!("TV power state unavailable; leaving sync unchanged: {error}");
                         last_tv_power_warning = tokio::time::Instant::now();
                     }
                 }
+                None => {}
             }
         }
 
@@ -870,9 +923,16 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         if web_stop_requested || pipeline_state == PipelineState::Paused || source_policy.blocked()
         {
             info!(
-                "Sync was stopped/paused (web={}). Entering paused idle state...",
-                web_stop_requested
+                "Sync paused ({}). Entering paused idle state...",
+                runtime::pause_cause(
+                    capture_faulted,
+                    source_policy.blocked(),
+                    source_policy.manually_stopped(),
+                    auto_tv_power && observed_tv_power == Some(false),
+                    web_stop_requested,
+                )
             );
+            luna.set_source_fps(false);
             if !capture_faulted {
                 shared_state.set_sync_state(SyncState::Stopping, None);
             }
@@ -941,10 +1001,12 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     tv_active: observed_tv_power,
                     hdmi_source: source_policy.compatible(),
                 };
-                if last_source_poll.elapsed() >= Duration::from_secs(2) {
-                    last_source_poll = tokio::time::Instant::now();
-                    source_policy
-                        .observe(crate::capture_source::current_source().await.compatible());
+                let observed = luna.take();
+                if let Some(source) = observed
+                    .as_ref()
+                    .and_then(|round| round.source_since(last_direct_source))
+                {
+                    source_policy.observe(source);
                 }
                 if source_policy.source_paused() && source_policy.blocked() {
                     shared_state.set_sync_state(SyncState::UnsupportedSource, Some("Built-in apps and Home are not supported by this capture backend; select HDMI to resume.".into()));
@@ -964,29 +1026,32 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     auto_tv_power = configured_auto_tv_power;
                     observed_tv_power = None;
                     shared_state.set_tv_power_state(None);
-                    last_tv_power_poll = tokio::time::Instant::now() - Duration::from_secs(2);
+                    luna.set_power(auto_tv_power);
+                    luna.poll_now();
                 }
 
                 let mut requested_running = pending_commands.desired_running.take();
                 let mut start_requested =
                     requested_running == Some(true) || source_policy.auto_resume();
-                if auto_tv_power && last_tv_power_poll.elapsed() >= Duration::from_secs(2) {
-                    last_tv_power_poll = tokio::time::Instant::now();
-                    match tv_power::is_active().await {
-                        Ok(state @ Some(_)) => {
+                if auto_tv_power {
+                    match observed.as_ref().and_then(|round| round.power.clone()) {
+                        Some(PowerObservation::State(state @ Some(active))) => {
                             shared_state.set_tv_power_state(state);
-                            let active = state.unwrap();
-                            if requested_running.is_none()
-                                && !source_policy.manually_stopped()
-                                && observed_tv_power == Some(false)
-                                && active
-                            {
+                            if runtime::tv_wake_starts(
+                                observed_tv_power,
+                                active,
+                                requested_running,
+                                source_policy.manually_stopped(),
+                            ) {
                                 start_requested = true;
                             }
                             observed_tv_power = Some(active);
                         }
-                        Ok(None) => shared_state.set_tv_power_state(None),
-                        Err(error) => {
+                        Some(PowerObservation::State(None)) => {
+                            shared_state.set_tv_power_state(None)
+                        }
+                        None => {}
+                        Some(PowerObservation::Unavailable(error)) => {
                             shared_state.set_tv_power_state(None);
                             if last_tv_power_warning.elapsed() >= Duration::from_secs(30) {
                                 warn!("TV power state unavailable; leaving sync paused: {error}");
@@ -1136,7 +1201,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             if auto_tv_power != live_st.auto_tv_power {
                 auto_tv_power = live_st.auto_tv_power;
                 observed_tv_power = None;
-                last_tv_power_poll = tokio::time::Instant::now() - Duration::from_secs(2);
+                luna.set_power(auto_tv_power);
+                luna.poll_now();
             }
             current_hue_brightness = live_st.brightness_multiplier * live_st.hue_output_brightness;
             current_use_xy = live_st.use_xy_gamut;
@@ -1493,8 +1559,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             }
             pending_commands.receive(&mut command_rx);
             source_policy.manual_request(pending_commands.manual_running.take());
+            last_direct_source = Some(tokio::time::Instant::now());
             source_policy.observe(crate::capture_source::current_source().await.compatible());
-            last_source_poll = tokio::time::Instant::now();
             pending_commands.receive(&mut command_rx);
             source_policy.manual_request(pending_commands.manual_running.take());
             if pending_commands.capture_restart_cancelled()
@@ -1525,9 +1591,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         }
 
         // In auto FPS mode, dynamically update cadence if TV source rate changed (e.g. film started)
-        if config.fps == 0 && last_source_fps_poll.elapsed() >= Duration::from_secs(2) {
-            last_source_fps_poll = tokio::time::Instant::now();
-            if let Some(new_fps) = detect_source_fps().await {
+        if config.fps == 0 {
+            if let Some(new_fps) = observed.as_ref().and_then(|round| round.source_fps) {
                 let clamped = new_fps.clamp(20.0, 60.0);
                 if (clamped - target_fps).abs() > 0.5 {
                     target_fps = clamped;
@@ -1835,8 +1900,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 watchdog.tick();
                 pending_commands.receive(&mut command_rx);
                 source_policy.manual_request(pending_commands.manual_running.take());
+                last_direct_source = Some(tokio::time::Instant::now());
                 source_policy.observe(crate::capture_source::current_source().await.compatible());
-                last_source_poll = tokio::time::Instant::now();
                 pending_commands.receive(&mut command_rx);
                 source_policy.manual_request(pending_commands.manual_running.take());
                 if pending_commands.capture_restart_cancelled()
@@ -2254,6 +2319,36 @@ impl WatchdogHeartbeat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hue_events_resubscribe_on_address_trust_or_area_change_only() {
+        let mut base = Config::new_default("192.0.2.1", "key", "client", "");
+        base.entertainment_configuration_id = Some("0b5f3a2e-1111-4222-8333-444455556666".into());
+        base.hue_bridge_id = Some("001788fffe000001".into());
+        base.hue_bridge_certificate_sha256 = Some("aa".repeat(32));
+        let subscribed = hue_event_subscription(&base);
+
+        let mut unrelated = base.clone();
+        unrelated.brightness_multiplier = 2.0;
+        unrelated.zones.clear();
+        assert_eq!(hue_event_subscription(&unrelated), subscribed);
+
+        let changes: [fn(&mut Config); 5] = [
+            |config| config.bridge_ip = "192.0.2.2".into(),
+            |config| config.hue_bridge_id = Some("001788fffe000002".into()),
+            |config| config.hue_bridge_certificate_sha256 = Some("bb".repeat(32)),
+            |config| {
+                config.entertainment_configuration_id =
+                    Some("0b5f3a2e-1111-4222-8333-444455557777".into())
+            },
+            |config| config.username = "other-key".into(),
+        ];
+        for change in changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(hue_event_subscription(&changed), subscribed);
+        }
+    }
 
     #[test]
     fn duplicate_output_frames_are_suppressed_but_meaningful_changes_pass() {

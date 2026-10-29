@@ -1426,7 +1426,8 @@ async fn pair_nanoleaf(
     let permit = claim_setup(&state)?;
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let ip = validate_device_ip(&ip)?;
+        let ip = validate_nanoleaf_ip(&ip)?;
+        // The stored pairing changes only after the new device answered pairing and layout.
         let (auth_token, segments, panel_ids) =
             nanoleaf::pair_nanoleaf(&ip, 45).map_err(|error| error.to_string())?;
         Config::update(
@@ -1458,6 +1459,18 @@ async fn pair_nanoleaf(
         .send_command(ControlCommand::Reconfigure)
         .await?;
     Ok(Json(StatusMessage { status: "paired" }))
+}
+
+/// Nanoleaf controllers sit on the LAN: only private (RFC 1918) or link-local IPv4 unicast.
+fn validate_nanoleaf_ip(value: &str) -> Result<String, String> {
+    match value.trim().parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) if ip.is_private() || ip.is_link_local() => Ok(ip.to_string()),
+        Ok(_) => Err(
+            "Nanoleaf IP must be a private IPv4 address (10.x, 172.16-31.x, 192.168.x or 169.254.x)"
+                .to_string(),
+        ),
+        Err(_) => Err("Enter a valid device IP address".to_string()),
+    }
 }
 
 fn validate_device_ip(value: &str) -> Result<String, String> {
@@ -2063,6 +2076,34 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
             serde_json::json!({"error": "sync controller is unavailable"})
         );
+    }
+
+    #[test]
+    fn nanoleaf_pairing_accepts_only_private_or_link_local_ipv4() {
+        for ip in [
+            "10.0.0.5",
+            "172.16.1.2",
+            "172.31.255.1",
+            " 192.168.1.20 ",
+            "169.254.3.4",
+        ] {
+            assert_eq!(validate_nanoleaf_ip(ip).unwrap(), ip.trim());
+        }
+        for ip in [
+            "8.8.8.8",
+            "172.32.0.1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "fe80::1",
+            "fd00::1",
+            "::1",
+            "192.168.1.20:80",
+            "nanoleaf.local",
+        ] {
+            assert!(validate_nanoleaf_ip(ip).is_err(), "{ip} accepted");
+        }
     }
 
     #[test]
