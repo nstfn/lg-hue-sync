@@ -68,7 +68,7 @@ help:
 	@printf "  $(GREEN)make provision-luna$(RESET) Provision Luna manifests and permissions for vtcapture on TV\n\n"
 	@printf "$(CYAN)Service Management & Remote Shell:$(RESET)\n"
 	@printf "  $(GREEN)make status$(RESET)        Check daemon systemd status on TV\n"
-	@printf "  $(GREEN)make logs$(RESET)          Follow daemon logs on TV (journalctl -f)\n"
+	@printf "  $(GREEN)make logs$(RESET)          Follow daemon.log on TV (tail -f; not in journalctl)\n"
 	@printf "  $(GREEN)make start$(RESET)         Start daemon on TV\n"
 	@printf "  $(GREEN)make stop$(RESET)          Stop daemon on TV\n"
 	@printf "  $(GREEN)make restart$(RESET)       Restart daemon on TV\n"
@@ -186,10 +186,12 @@ deploy-bin: require-tv provision-luna
 	@printf "$(CYAN)[*] Deploying binary to root@$(TV_IP)...$(RESET)\n"
 	ssh $(SSH_OPTS) root@$(TV_IP) "mkdir -p $(REMOTE_DIR)"
 	scp $(SCP_OPTS) $(BINARY) root@$(TV_IP):$(REMOTE_DIR)/lg-hue-sync.new
+	@# The swap verifies the SHA-256 again, keeps a rollback binary, and stops
+	@# the service only for the swap (same script as scripts/deploy.sh).
 	@LOCAL_SHA=$$(shasum -a 256 $(BINARY) | awk '{print $$1}'); \
 	REMOTE_SHA=$$(ssh $(SSH_OPTS) root@$(TV_IP) "sha256sum $(REMOTE_DIR)/lg-hue-sync.new" | awk '{print $$1}'); \
-	test "$$LOCAL_SHA" = "$$REMOTE_SHA" || { echo "Binary checksum mismatch" >&2; exit 1; }
-	ssh $(SSH_OPTS) root@$(TV_IP) "systemctl stop lg-hue-sync 2>/dev/null || true; if [ -x $(REMOTE_DIR)/lg-hue-sync ]; then cp -f $(REMOTE_DIR)/lg-hue-sync $(REMOTE_DIR)/lg-hue-sync.previous; fi; mv -f $(REMOTE_DIR)/lg-hue-sync.new $(REMOTE_DIR)/lg-hue-sync; chmod +x $(REMOTE_DIR)/lg-hue-sync; systemctl start lg-hue-sync"
+	test "$$LOCAL_SHA" = "$$REMOTE_SHA" || { echo "Binary checksum mismatch" >&2; exit 1; }; \
+	ssh $(SSH_OPTS) root@$(TV_IP) "SHA=$$LOCAL_SHA sh -s" < scripts/swap_binary.sh
 	@printf "$(GREEN)[+] Binary deployed and service started.$(RESET)\n"
 
 ## provision Luna Service 2 manifests and permissions on TV
@@ -204,8 +206,8 @@ deploy-config: require-tv
 	fi
 	@printf "$(CYAN)[*] Deploying config.json to root@$(TV_IP)...$(RESET)\n"
 	ssh $(SSH_OPTS) root@$(TV_IP) "mkdir -p $(REMOTE_DIR)"
-	scp $(SCP_OPTS) config.json root@$(TV_IP):$(REMOTE_DIR)/config.json
-	ssh $(SSH_OPTS) root@$(TV_IP) "systemctl restart lg-hue-sync"
+	@# Mode 600 from creation: config.json holds the Hue and Nanoleaf credentials.
+	ssh $(SSH_OPTS) root@$(TV_IP) "umask 077 && cat > $(REMOTE_DIR)/config.json.new && chmod 600 $(REMOTE_DIR)/config.json.new && mv -f $(REMOTE_DIR)/config.json.new $(REMOTE_DIR)/config.json && systemctl restart lg-hue-sync" < config.json
 	@printf "$(GREEN)[+] Config deployed and service restarted.$(RESET)\n"
 
 ## package and deploy webOS application to Home Dashboard ribbon

@@ -31,9 +31,10 @@ TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo "[*] Querying latest DejaVuln release from GitHub ($REPO)..."
-LATEST_RELEASE_JSON=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
-DOWNLOAD_URL=$(echo "$LATEST_RELEASE_JSON" | grep "browser_download_url" | cut -d '"' -f 4 | grep -E '\.zip$' | head -n 1)
-TAG_NAME=$(echo "$LATEST_RELEASE_JSON" | grep "tag_name" | cut -d '"' -f 4 | head -n 1)
+# -f: an HTTP error is a failure, not a body to parse; the fallback below covers it.
+LATEST_RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") || LATEST_RELEASE_JSON=""
+DOWNLOAD_URL=$(echo "$LATEST_RELEASE_JSON" | grep "browser_download_url" | cut -d '"' -f 4 | grep -E '\.zip$' | head -n 1) || DOWNLOAD_URL=""
+TAG_NAME=$(echo "$LATEST_RELEASE_JSON" | grep "tag_name" | cut -d '"' -f 4 | head -n 1) || TAG_NAME=""
 
 if [ -z "$DOWNLOAD_URL" ]; then
     echo "[-] Failed to fetch download URL. Falling back to known release v0.0.10..."
@@ -43,7 +44,7 @@ fi
 
 echo "[+] Found release $TAG_NAME"
 echo "[*] Downloading: $DOWNLOAD_URL"
-curl -L -o "$TMP_DIR/dejavuln.zip" "$DOWNLOAD_URL"
+curl -fL -o "$TMP_DIR/dejavuln.zip" "$DOWNLOAD_URL"
 
 echo "[*] Extracting files into $TARGET_DIR..."
 unzip -q -o "$TMP_DIR/dejavuln.zip" -d "$TARGET_DIR"
@@ -65,5 +66,5 @@ echo "   - Enable 'SSH Server' (default port: 22)"
 echo "   - Verify 'Root status' shows OK"
 echo "   - Ensure 'Telnet' is disabled for network security"
 echo "8. Take note of the TV's IP address (Settings -> Network -> Wi-Fi Connection)."
-echo "9. Proceed to run: ./scripts/provision_tv.sh <TV_IP>"
+echo "9. Proceed to run: ./scripts/deploy.sh <TV_IP>"
 echo "==================================================================="

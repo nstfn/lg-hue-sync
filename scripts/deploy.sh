@@ -62,6 +62,10 @@ if ! nc -z -w 3 "$TV_IP" "$SSH_PORT" &>/dev/null; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Everything up to the swap runs while the service keeps running, so a failure
+# here (upload, checksum, Luna provisioning, IPK install) leaves the old daemon up.
 echo "[*] Connecting to root@$TV_IP:$SSH_PORT..."
 ssh $SSH_OPTS root@"$TV_IP" "mkdir -p $REMOTE_DIR"
 
@@ -73,21 +77,17 @@ if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
     echo "[-] Binary checksum mismatch; existing binary was not replaced." >&2
     exit 1
 fi
-ssh $SSH_OPTS root@"$TV_IP" "systemctl stop lg-hue-sync 2>/dev/null || true; if [ -x $REMOTE_DIR/lg-hue-sync ]; then cp -f $REMOTE_DIR/lg-hue-sync $REMOTE_DIR/lg-hue-sync.previous; fi; mv -f $REMOTE_DIR/lg-hue-sync.new $REMOTE_DIR/lg-hue-sync; chmod +x $REMOTE_DIR/lg-hue-sync"
 
 if $WITH_CONFIG; then
+    # Created with mode 600 under a temporary name; the swap moves it into place.
     echo "[*] Uploading local config.json..."
-    scp $SCP_OPTS config.json root@"$TV_IP":"$REMOTE_DIR/config.json"
-    ssh $SSH_OPTS root@"$TV_IP" "chmod 600 $REMOTE_DIR/config.json"
+    ssh $SSH_OPTS root@"$TV_IP" "umask 077 && cat > $REMOTE_DIR/config.json.new && chmod 600 $REMOTE_DIR/config.json.new" < config.json
 fi
 
-# 3. Upload and execute Luna Service 2 provisioning script
-echo "[*] Uploading provision_luna.sh to TV..."
-scp $SCP_OPTS "$(dirname "$0")/provision_luna.sh" root@"$TV_IP":"$REMOTE_DIR/provision_luna.sh"
-ssh $SSH_OPTS root@"$TV_IP" "chmod +x $REMOTE_DIR/provision_luna.sh"
-
-echo "[*] Provisioning Luna permissions for org.webosbrew.lg-hue-sync on TV..."
-ssh $SSH_OPTS root@"$TV_IP" "$REMOTE_DIR/provision_luna.sh local"
+# 3. Luna Service 2 provisioning: the script runs over SSH from this computer,
+# so no root-executed copy stays in the install directory. An older deploy left
+# one there for the boot hook; step 5 removes it.
+"$SCRIPT_DIR/provision_luna.sh" "$TV_IP" "$SSH_PORT"
 
 # 4. Package and deploy webOS Application to Home Dashboard ribbon
 if [ -n "$IPK_PATH" ]; then
@@ -96,7 +96,7 @@ if [ -n "$IPK_PATH" ]; then
     ssh $SSH_OPTS root@"$TV_IP" "luna-send -n 1 -f luna://com.webos.appInstallService/dev/install '{\"id\":\"org.webosbrew.lg-hue-sync\", \"ipkUrl\":\"/tmp/org.webosbrew.lg-hue-sync.ipk\", \"subscribe\":false}' || true"
 fi
 
-# 5. Create persistent systemd unit & webosbrew init.d autostart hook
+# 5. Write the systemd unit and the webosbrew init.d boot hook (no start yet).
 echo "[*] Installing persistent webosbrew autostart hook on TV..."
 ssh $SSH_OPTS root@"$TV_IP" bash << 'REMOTEEOC'
 set -e
@@ -105,40 +105,53 @@ cat << 'EOF' > /var/home/root/lg-hue-sync/lg-hue-sync.service
 Description=LG C1 Native Philips Hue & Nanoleaf Sync Daemon
 After=network.target
 Conflicts=sleep.target suspend.target
+# Stop a crash loop: at most 10 starts in 30 minutes.
+StartLimitIntervalSec=30min
+StartLimitBurst=10
 
 [Service]
 Type=simple
 WorkingDirectory=/var/home/root/lg-hue-sync
 ExecStart=/bin/sh -c 'exec /var/home/root/lg-hue-sync/lg-hue-sync run --config /var/home/root/lg-hue-sync/config.json >> /var/home/root/lg-hue-sync/daemon.log 2>&1'
+# always, not on-failure: after pairing the daemon exits 0 on purpose and
+# relies on systemd to start it again with the new configuration.
 Restart=always
 RestartSec=5
-TimeoutStopSec=3
+# At shutdown the daemon may need about 7 s to stop the Hue stream and turn
+# the lights off.
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+# Boot hook: Luna files live under /var and persist across reboots, so the hook
+# does not provision them again; the unit goes to /run, which is a tmpfs.
 mkdir -p /var/lib/webosbrew/init.d
-cat << 'EOF' > /var/lib/webosbrew/init.d/50-lg-hue-sync
+cat << 'EOF' > /var/lib/webosbrew/init.d/50-lg-hue-sync.tmp
 #!/bin/sh
-if [ -x /var/home/root/lg-hue-sync/provision_luna.sh ]; then
-    /var/home/root/lg-hue-sync/provision_luna.sh local || true
-fi
+# touch /var/home/root/lg-hue-sync/DISABLE to skip the start at boot.
+D=/var/home/root/lg-hue-sync
+U=lg-hue-sync.service
+[ ! -e "$D/DISABLE" ] || exit 0
+[ -x "$D/lg-hue-sync" ] || exit 0
+[ -f "$D/$U" ] || exit 0
 mkdir -p /run/systemd/system
-cp -f /var/home/root/lg-hue-sync/lg-hue-sync.service /run/systemd/system/lg-hue-sync.service
+cp -f "$D/$U" "/run/systemd/system/$U"
 systemctl daemon-reload
-systemctl stop lg-hue-sync 2>/dev/null || true
-sleep 2
-systemctl start lg-hue-sync
+systemctl --no-block start "$U"
 EOF
-chmod +x /var/lib/webosbrew/init.d/50-lg-hue-sync
-
-# Launch now
-/var/lib/webosbrew/init.d/50-lg-hue-sync
-echo "[TV] Service installed and started via systemd (/var/lib/webosbrew/init.d/50-lg-hue-sync)"
+chmod 755 /var/lib/webosbrew/init.d/50-lg-hue-sync.tmp
+mv -f /var/lib/webosbrew/init.d/50-lg-hue-sync.tmp /var/lib/webosbrew/init.d/50-lg-hue-sync
+rm -f /var/home/root/lg-hue-sync/provision_luna.sh
 REMOTEEOC
 
-scp $SCP_OPTS "$(dirname "$0")/log-maintenance.sh" root@"$TV_IP":"$REMOTE_DIR/log-maintenance.sh"
+# 6. Stop, swap and start in one remote command; it verifies the SHA-256 again,
+# keeps a rollback binary, and starts the previous binary if the swap fails.
+echo "[*] Swapping binary and restarting the service..."
+ssh $SSH_OPTS root@"$TV_IP" "SHA=$LOCAL_SHA WITH_CONFIG=$WITH_CONFIG INSTALL_UNIT=true sh -s" < "$SCRIPT_DIR/swap_binary.sh"
+
+scp $SCP_OPTS "$SCRIPT_DIR/log-maintenance.sh" root@"$TV_IP":"$REMOTE_DIR/log-maintenance.sh"
 ssh $SSH_OPTS root@"$TV_IP" "chmod 755 $REMOTE_DIR/log-maintenance.sh && $REMOTE_DIR/log-maintenance.sh --install"
 
 echo ""
@@ -147,7 +160,7 @@ echo "[+] SUCCESS: lg-hue-sync deployed and active on TV!"
 echo "==================================================================="
 echo "Management commands on TV (via SSH):"
 echo "  Status:  ssh -p $SSH_PORT root@$TV_IP 'systemctl status lg-hue-sync'"
-echo "  Logs:    ssh -p $SSH_PORT root@$TV_IP 'journalctl -u lg-hue-sync -f'"
+echo "  Logs:    ssh -p $SSH_PORT root@$TV_IP 'tail -f /var/home/root/lg-hue-sync/daemon.log'"
 echo "  Restart: ssh -p $SSH_PORT root@$TV_IP 'systemctl restart lg-hue-sync'"
 echo "  Stop:    ssh -p $SSH_PORT root@$TV_IP 'systemctl stop lg-hue-sync'"
 echo "==================================================================="
