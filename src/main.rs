@@ -27,7 +27,7 @@ use capture::{
     create_capture, detect_source_fps, release_capture, CaptureRecovery, MockCapture,
     RecoveryAction, ScreenCapture, VtCapture,
 };
-use color::{RgbColor, ZoneSampler};
+use color::{FloatColor, LetterboxTracker, RgbColor, ZoneSampler};
 use config::{Config, ConfigError};
 use hue::{
     reconnect::HueReconnect, sync_entertainment_areas, HueDtlsClient, HueStreamPacketBuilder,
@@ -765,6 +765,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut nanoleaf_retry = RetryState::new();
     let mut nanoleaf_only_frame_count = 0u64;
     let mut nanoleaf_only_global = RgbColor::new(0, 0, 0);
+    let mut nanoleaf_only_letterbox = LetterboxTracker::default();
     let mut pending_commands = PendingCommands {
         desired_running: (!pipeline_should_run).then_some(false),
         ..PendingCommands::default()
@@ -1587,11 +1588,13 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             || nanoleaf_only_frame_count.is_multiple_of(15))
                     {
                         if let Some(ref mut sampler) = nanoleaf_sampler {
-                            sampler.set_active_rect(ZoneSampler::detect_active_rect(
-                                frame.data,
-                                frame.width,
-                                frame.height,
-                                frame.is_bgra,
+                            sampler.set_active_rect(nanoleaf_only_letterbox.observe(
+                                ZoneSampler::detect_active_rect(
+                                    frame.data,
+                                    frame.width,
+                                    frame.height,
+                                    frame.is_bgra,
+                                ),
                             ));
                         }
                     }
@@ -1602,7 +1605,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     if let (Some(ref mut sampler), Some(ref mut dtls), Some(ref mut builder)) =
                         (&mut hue_sampler, &mut hue_dtls, &mut hue_packet_builder)
                     {
-                        let (sampled_zones, cut) = sampler.sample_frame(
+                        let (sampled_zones, cut) = sampler.sample_frame_precise(
                             frame.data,
                             frame.width,
                             frame.height,
@@ -1616,16 +1619,23 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         }
 
                         let calibration = calibration_pattern(&shared_state);
-                        let sampled_zones = calibration
-                            .map(|pattern| calibration_zone_colors(pattern, &config.zones))
+                        let sampled_zones: Vec<(u8, FloatColor)> = calibration
+                            .map(|pattern| {
+                                calibration_zone_colors(pattern, &config.zones)
+                                    .into_iter()
+                                    .map(|(channel_id, color)| (channel_id, color.into()))
+                                    .collect()
+                            })
                             .unwrap_or(sampled_zones);
+                        // Trim and convert to 16 bits from the fractional state, with one
+                        // factor for all channels so highlights keep their hue.
                         let channels: Vec<(u8, (u16, u16, u16))> = sampled_zones
                             .iter()
                             .map(|(channel_id, color)| {
                                 let scaled = if calibration.is_some() {
                                     *color
                                 } else {
-                                    color.scale(current_hue_brightness)
+                                    color.trim(current_hue_brightness)
                                 };
                                 if calibration.is_none() && current_use_xy {
                                     (*channel_id, scaled.to_xy_u16(color::HueGamut::GamutC))
@@ -1636,7 +1646,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                             .collect();
 
                         // Share live sampled Hue colors with Web UI
-                        *shared_state.live_hue_colors.write().unwrap() = sampled_zones;
+                        *shared_state.live_hue_colors.write().unwrap() = sampled_zones
+                            .iter()
+                            .map(|(channel_id, color)| (*channel_id, color.to_rgb()))
+                            .collect();
 
                         // Adaptive deadband throttling for Hue Bridge
                         let is_virtually_identical =

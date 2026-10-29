@@ -154,7 +154,8 @@ fn copy_frame(frame: &CapturedFrame<'_>, now: u64) -> Option<PreviewFrame> {
     })
 }
 
-/// Colour grading only: excludes regional sampling, peak weighting, spatial/temporal response and device trims.
+/// Colour grading and the hue-preserving Hue output trim. Excludes regional sampling, peak
+/// weighting, spatial/temporal response and the Nanoleaf trim.
 pub fn render(frame: &PreviewFrame, settings: &LiveSettings) -> Result<PreviewFrame, String> {
     if frame.width == 0
         || frame.height == 0
@@ -166,6 +167,7 @@ pub fn render(frame: &PreviewFrame, settings: &LiveSettings) -> Result<PreviewFr
     }
     for (value, low, high) in [
         (settings.brightness_multiplier, 0.5, 2.5),
+        (settings.hue_output_brightness, 0.25, 2.0),
         (settings.saturation_boost, 1.0, 2.5),
         (settings.gamma, 0.8, 2.0),
         (settings.noise_gate_threshold, 0.0, 0.06),
@@ -181,13 +183,12 @@ pub fn render(frame: &PreviewFrame, settings: &LiveSettings) -> Result<PreviewFr
         settings.noise_gate_threshold,
     );
     processor.set_gamma(settings.gamma);
+    // Same trim as the Hue output path: one factor for all channels, capped at 255.
+    let trim = settings.brightness_multiplier * settings.hue_output_brightness;
     let mut output = frame.clone();
     for pixel in output.rgb.as_chunks_mut::<3>().0 {
         let color = FloatColor::new(pixel[0].into(), pixel[1].into(), pixel[2].into());
-        let color = processor
-            .transform_color(color)
-            .to_rgb()
-            .scale(settings.brightness_multiplier);
+        let color = processor.transform_color(color).trim(trim).to_rgb();
         pixel.copy_from_slice(&[color.r, color.g, color.b]);
     }
     Ok(output)
@@ -285,6 +286,22 @@ mod tests {
             render(&frame, &settings).unwrap().rgb,
             vec![254, 64, 64, 0, 0, 0]
         );
+        // The Hue trim scales all channels by one factor: orange keeps its R:G ratio.
+        settings.saturation_boost = 1.0;
+        settings.gamma = 1.0;
+        settings.brightness_multiplier = 1.0;
+        settings.hue_output_brightness = 1.3;
+        let orange = PreviewFrame {
+            width: 2,
+            height: 1,
+            rgb: vec![255, 128, 0, 100, 50, 0],
+            captured_unix_ms: 1,
+        };
+        assert_eq!(
+            render(&orange, &settings).unwrap().rgb,
+            vec![255, 128, 0, 130, 65, 0]
+        );
+        settings.hue_output_brightness = 1.0;
         settings.gamma = f32::NAN;
         assert!(render(&frame, &settings).is_err());
         settings.gamma = 1.0;

@@ -572,8 +572,7 @@ impl NanoleafPerimeterSampler {
                         peak_pixel = pix;
                     }
 
-                    let sat = pix.saturation();
-                    let weight = self.processor.sample_weight(sat);
+                    let weight = self.processor.sample_weight(pix.chroma());
 
                     weighted_r += (r_raw as f32) * weight;
                     weighted_g += (g_raw as f32) * weight;
@@ -612,7 +611,7 @@ impl NanoleafPerimeterSampler {
         });
         result
             .into_iter()
-            .map(|c| c.scale(self.brightness_multiplier).to_rgb())
+            .map(|c| c.trim(self.brightness_multiplier).to_rgb())
             .collect()
     }
 }
@@ -708,11 +707,11 @@ mod tests {
         // Synthetic 4x4 frame of bright red (RGBA)
         let red_frame = vec![255, 0, 0, 255].repeat(16);
 
-        // Scene cuts bypass EMA but must still respect the flash-safety limiter.
+        // Scene cuts bypass EMA and move 4x the normal step, but stay under the flash-safety limiter.
         let colors = sampler.sample_frame(&red_frame, 4, 4, false, true);
         assert_eq!(colors.len(), 4);
         for c in &colors {
-            assert_eq!(c.r, 12);
+            assert_eq!(c.r, 48);
             assert_eq!(c.g, 0);
             assert_eq!(c.b, 0);
         }
