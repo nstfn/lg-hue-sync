@@ -888,7 +888,8 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         if pending_commands.desired_running == Some(true) || pending_commands.restart {
             hue_status.blocked = hue_status.needs_refresh;
         }
-        let web_stop_requested = pending_commands.take_stop_if_running(pipeline_state);
+        let web_stop_requested =
+            pending_commands.take_stop_if_running(pipeline_state, capture_faulted);
 
         // Bridge reads run on their own worker; only current-session results affect output.
         if hue_active
@@ -1239,11 +1240,12 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                                     .store(true, Ordering::Relaxed);
                             }
                             Err(error) => {
-                                nanoleaf_sync_enabled = false;
+                                // Keep the user's setting: the live settings and a later Save
+                                // still say on. As at startup, the next resume or toggle retries.
                                 shared_state
                                     .nanoleaf_connected
                                     .store(false, Ordering::Relaxed);
-                                warn!("Nanoleaf sync remains off: {}", error);
+                                warn!("Nanoleaf unavailable; sync stays enabled and retries at the next resume or toggle: {}", error);
                             }
                         }
                     }

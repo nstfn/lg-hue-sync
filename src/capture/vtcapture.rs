@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use super::{CaptureError, CapturedFrame, NativeCaptureError, ScreenCapture};
@@ -65,6 +67,108 @@ type FnVtCapturePostprocess = unsafe extern "C" fn(*mut c_void, *const c_char) -
 type FnVtCaptureFinalize = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
 type FnVtCaptureRelease = unsafe extern "C" fn(*mut c_void) -> c_int;
 
+/// libvtcapture entry points, resolved once per process. The library is never unloaded:
+/// a `dlclose` at each capture restart could unmap code that the driver's own threads still run.
+struct VtCaptureApi {
+    create: FnVtCaptureCreate,
+    init: FnVtCaptureInit,
+    preprocess: FnVtCapturePreprocess,
+    plane_info: FnVtCapturePlaneInfo,
+    process: FnVtCaptureProcess,
+    current_buff_info: FnVtCaptureCurrentCaptureBuffInfo,
+    stop: FnVtCaptureStop,
+    postprocess: FnVtCapturePostprocess,
+    finalize: FnVtCaptureFinalize,
+    release: FnVtCaptureRelease,
+    _lib: Library,
+}
+
+static VTCAPTURE_API: OnceLock<VtCaptureApi> = OnceLock::new();
+static VTCAPTURE_API_LOAD: Mutex<()> = Mutex::new(());
+
+impl VtCaptureApi {
+    /// Loads the library on first use. A failed load is not cached, so a later session retries.
+    fn shared() -> Result<&'static Self> {
+        if let Some(api) = VTCAPTURE_API.get() {
+            return Ok(api);
+        }
+        // One loader at a time, so a race never opens and closes a second handle.
+        let _guard = VTCAPTURE_API_LOAD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(api) = VTCAPTURE_API.get() {
+            return Ok(api);
+        }
+        info!(
+            "Loading webOS libvtcapture driver from {}...",
+            LIBVTCAPTURE_PATH
+        );
+        let api = unsafe { Self::load()? };
+        Ok(VTCAPTURE_API.get_or_init(|| api))
+    }
+
+    unsafe fn load() -> Result<Self> {
+        let lib = unsafe { Library::new(LIBVTCAPTURE_PATH) }
+            .map_err(|e| anyhow!("Failed to dlopen {}: {}", LIBVTCAPTURE_PATH, e))?;
+        fn symbol<T: Copy>(lib: &Library, name: &'static [u8]) -> Result<T> {
+            // SAFETY: each caller names the C type of the exported symbol.
+            let symbol: Symbol<T> = unsafe { lib.get(name) }.map_err(|e| {
+                anyhow!(
+                    "Symbol {} not found: {}",
+                    String::from_utf8_lossy(&name[..name.len() - 1]),
+                    e
+                )
+            })?;
+            Ok(*symbol)
+        }
+        Ok(Self {
+            create: symbol(&lib, b"vtCapture_create\0")?,
+            init: symbol(&lib, b"vtCapture_init\0")?,
+            preprocess: symbol(&lib, b"vtCapture_preprocess\0")?,
+            plane_info: symbol(&lib, b"vtCapture_planeInfo\0")?,
+            process: symbol(&lib, b"vtCapture_process\0")?,
+            current_buff_info: symbol(&lib, b"vtCapture_currentCaptureBuffInfo\0")?,
+            stop: symbol(&lib, b"vtCapture_stop\0")?,
+            postprocess: symbol(&lib, b"vtCapture_postprocess\0")?,
+            finalize: symbol(&lib, b"vtCapture_finalize\0")?,
+            release: symbol(&lib, b"vtCapture_release\0")?,
+            // The function pointers above stay valid because this handle is never dropped.
+            _lib: lib,
+        })
+    }
+}
+
+/// A buffer address unchanged for this long means a frozen video pipe or a timing change.
+const STALE_BUFFER_TIMEOUT: Duration = Duration::from_secs(3);
+/// A longer gap between two reads proves nothing about the driver, so the window restarts.
+const STALE_BUFFER_MAX_GAP: Duration = Duration::from_secs(1);
+
+/// Detects a capture buffer address that stays the same for `STALE_BUFFER_TIMEOUT` of
+/// wall-clock time, read at least every `STALE_BUFFER_MAX_GAP`. Any address change resets it.
+#[derive(Debug, Default)]
+struct StaleBufferDetector {
+    last_addr: usize,
+    unchanged_since: Option<Instant>,
+    last_seen: Option<Instant>,
+}
+
+impl StaleBufferDetector {
+    /// Returns true once the same address has been read continuously for the timeout.
+    fn observe(&mut self, addr: usize, now: Instant) -> bool {
+        let gap_too_long = self
+            .last_seen
+            .is_none_or(|seen| now.saturating_duration_since(seen) > STALE_BUFFER_MAX_GAP);
+        self.last_seen = Some(now);
+        if addr != self.last_addr || gap_too_long {
+            self.last_addr = addr;
+            self.unchanged_since = Some(now);
+            return false;
+        }
+        self.unchanged_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= STALE_BUFFER_TIMEOUT)
+    }
+}
+
 /// Native libvtcapture driver implementation for LG webOS 6.x (LG C1 OLED).
 pub struct VtCapture {
     driver: *mut c_void,
@@ -74,16 +178,10 @@ pub struct VtCapture {
     stride: u32,
     rgb_buffer: Vec<u8>,
     is_stopped: bool,
-    last_addr0: usize,
-    stale_count: u32,
+    stale_buffer: StaleBufferDetector,
     raw_stats_enabled: bool,
     last_raw_stats: Option<RawNv12Stats>,
-    fn_current_buff_info: FnVtCaptureCurrentCaptureBuffInfo,
-    fn_stop: FnVtCaptureStop,
-    fn_postprocess: FnVtCapturePostprocess,
-    fn_finalize: FnVtCaptureFinalize,
-    fn_release: FnVtCaptureRelease,
-    _lib: Library,
+    api: &'static VtCaptureApi,
 }
 
 /// Aggregate of a central, at-most-16x16 NV12 patch; no frame pixels are retained.
@@ -173,45 +271,21 @@ impl VtCapture {
         // Counts every attempt that reaches the driver, failed or not.
         super::claim_capture_session()?;
 
-        info!(
-            "Loading webOS libvtcapture driver from {}...",
-            LIBVTCAPTURE_PATH
-        );
-        let lib = unsafe { Library::new(LIBVTCAPTURE_PATH) }
-            .map_err(|e| anyhow!("Failed to dlopen {}: {}", LIBVTCAPTURE_PATH, e))?;
+        let api = VtCaptureApi::shared()?;
+        let VtCaptureApi {
+            create: fn_create,
+            init: fn_init,
+            preprocess: fn_preprocess,
+            plane_info: fn_plane_info,
+            process: fn_process,
+            stop: fn_stop,
+            postprocess: fn_postprocess,
+            finalize: fn_finalize,
+            release: fn_release,
+            ..
+        } = *api;
 
         unsafe {
-            let fn_create: Symbol<FnVtCaptureCreate> = lib
-                .get(b"vtCapture_create\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_create not found: {}", e))?;
-            let fn_init: Symbol<FnVtCaptureInit> = lib
-                .get(b"vtCapture_init\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_init not found: {}", e))?;
-            let fn_preprocess: Symbol<FnVtCapturePreprocess> =
-                lib.get(b"vtCapture_preprocess\0")
-                    .map_err(|e| anyhow!("Symbol vtCapture_preprocess not found: {}", e))?;
-            let fn_plane_info: Symbol<FnVtCapturePlaneInfo> = lib
-                .get(b"vtCapture_planeInfo\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_planeInfo not found: {}", e))?;
-            let fn_process: Symbol<FnVtCaptureProcess> = lib
-                .get(b"vtCapture_process\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_process not found: {}", e))?;
-            let fn_current_buff_info: Symbol<FnVtCaptureCurrentCaptureBuffInfo> = lib
-                .get(b"vtCapture_currentCaptureBuffInfo\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_currentCaptureBuffInfo not found: {}", e))?;
-            let fn_stop: Symbol<FnVtCaptureStop> = lib
-                .get(b"vtCapture_stop\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_stop not found: {}", e))?;
-            let fn_postprocess: Symbol<FnVtCapturePostprocess> = lib
-                .get(b"vtCapture_postprocess\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_postprocess not found: {}", e))?;
-            let fn_finalize: Symbol<FnVtCaptureFinalize> = lib
-                .get(b"vtCapture_finalize\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_finalize not found: {}", e))?;
-            let fn_release: Symbol<FnVtCaptureRelease> = lib
-                .get(b"vtCapture_release\0")
-                .map_err(|e| anyhow!("Symbol vtCapture_release not found: {}", e))?;
-
             // 1. Create driver instance
             let driver = fn_create();
             if driver.is_null() {
@@ -362,16 +436,10 @@ impl VtCapture {
                 stride,
                 rgb_buffer: vec![0; rgb_size],
                 is_stopped: false,
-                last_addr0: 0,
-                stale_count: 0,
+                stale_buffer: StaleBufferDetector::default(),
                 raw_stats_enabled: false,
                 last_raw_stats: None,
-                fn_current_buff_info: *fn_current_buff_info,
-                fn_stop: *fn_stop,
-                fn_postprocess: *fn_postprocess,
-                fn_finalize: *fn_finalize,
-                fn_release: *fn_release,
-                _lib: lib,
+                api,
             })
         }
     }
@@ -383,9 +451,9 @@ impl VtCapture {
         }
         unsafe {
             let client_ptr = self.client_id.as_ptr() as *const c_char;
-            (self.fn_stop)(self.driver, client_ptr);
-            (self.fn_postprocess)(self.driver, client_ptr);
-            (self.fn_finalize)(self.driver, client_ptr);
+            (self.api.stop)(self.driver, client_ptr);
+            (self.api.postprocess)(self.driver, client_ptr);
+            (self.api.finalize)(self.driver, client_ptr);
             self.is_stopped = true;
         }
         info!("[-] Released vtCapture hardware scaler channel.");
@@ -508,7 +576,7 @@ impl ScreenCapture for VtCapture {
             size1: 0,
         };
 
-        let ret = unsafe { (self.fn_current_buff_info)(self.driver, &mut buf_info) };
+        let ret = unsafe { (self.api.current_buff_info)(self.driver, &mut buf_info) };
         if ret != 0 || buf_info.start_addr0.is_null() {
             return Err(CaptureError::Unavailable(NativeCaptureError {
                 backend: "libvtcapture",
@@ -521,21 +589,17 @@ impl ScreenCapture for VtCapture {
             }));
         }
 
-        let curr_addr = buf_info.start_addr0 as usize;
-        if curr_addr == self.last_addr0 {
-            self.stale_count += 1;
-            // Unchanged address for > 1.5s (90 frames at 60 FPS) indicates frozen video pipe / timing change
-            if self.stale_count >= 90 {
-                warn!("Hardware capture buffer address unchanged for 1.5s: resetting pipeline to prevent display mute...");
-                self.stop_stream();
-                return Err(CaptureError::RestartRequired {
-                    backend: "libvtcapture",
-                    reason: "buffer address unchanged for 90 acquisitions",
-                });
-            }
-        } else {
-            self.last_addr0 = curr_addr;
-            self.stale_count = 0;
+        // Elapsed time, not a read count: the loop rate varies with the source FPS.
+        if self
+            .stale_buffer
+            .observe(buf_info.start_addr0 as usize, Instant::now())
+        {
+            warn!("Hardware capture buffer address unchanged for 3 s: resetting pipeline to prevent display mute...");
+            self.stop_stream();
+            return Err(CaptureError::RestartRequired {
+                backend: "libvtcapture",
+                reason: "buffer address unchanged for 3 s",
+            });
         }
 
         let (y_len, uv_len, _) = nv12_lengths(self.width, self.height, self.stride)?;
@@ -603,11 +667,11 @@ impl Drop for VtCapture {
             if !self.driver.is_null() {
                 let client_ptr = self.client_id.as_ptr() as *const c_char;
                 if !self.is_stopped {
-                    (self.fn_stop)(self.driver, client_ptr);
-                    (self.fn_postprocess)(self.driver, client_ptr);
-                    (self.fn_finalize)(self.driver, client_ptr);
+                    (self.api.stop)(self.driver, client_ptr);
+                    (self.api.postprocess)(self.driver, client_ptr);
+                    (self.api.finalize)(self.driver, client_ptr);
                 }
-                (self.fn_release)(self.driver);
+                (self.api.release)(self.driver);
                 self.driver = std::ptr::null_mut();
             }
         }
@@ -653,6 +717,50 @@ mod tests {
                 crate::capture::RecoveryAction::Restart(_)
             ));
         }
+    }
+
+    #[test]
+    fn stale_buffer_fires_only_after_three_seconds_of_one_address() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut detector = StaleBufferDetector::default();
+        assert!(!detector.observe(0x1000, at(0)));
+        for ms in (33..3000).step_by(33) {
+            assert!(!detector.observe(0x1000, at(ms)), "fired early at {ms} ms");
+        }
+        assert!(detector.observe(0x1000, at(3000)));
+    }
+
+    #[test]
+    fn stale_buffer_never_fires_while_the_address_changes() {
+        let start = Instant::now();
+        let mut detector = StaleBufferDetector::default();
+        // Three rotating buffers, read every 33 ms for 10 s.
+        for (i, ms) in (0..10_000u64).step_by(33).enumerate() {
+            let addr = 0x1000 + (i % 3) * 0x100;
+            assert!(!detector.observe(addr, start + Duration::from_millis(ms)));
+        }
+        // Even a change every 2.9 s keeps it quiet.
+        let mut detector = StaleBufferDetector::default();
+        for (i, ms) in (0..30_000u64).step_by(100).enumerate() {
+            let addr = 0x1000 + (i / 29 % 2) * 0x100;
+            assert!(!detector.observe(addr, start + Duration::from_millis(ms)));
+        }
+    }
+
+    #[test]
+    fn stale_buffer_restarts_its_window_after_a_read_gap() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut detector = StaleBufferDetector::default();
+        assert!(!detector.observe(0x1000, at(0)));
+        assert!(!detector.observe(0x1000, at(500)));
+        // A 2.6 s pause between reads is no evidence of a frozen pipe.
+        assert!(!detector.observe(0x1000, at(3100)));
+        for ms in (3600..6100).step_by(500) {
+            assert!(!detector.observe(0x1000, at(ms)), "fired early at {ms} ms");
+        }
+        assert!(detector.observe(0x1000, at(6100)));
     }
 
     #[test]

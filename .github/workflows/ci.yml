@@ -47,7 +47,8 @@ jobs:
         run: |
           mkdir -p release
           cp target/armv7-unknown-linux-gnueabi/release/lg-hue-sync release/lg-hue-sync-armv7
-          sha256sum release/lg-hue-sync-armv7 > release/SHA256SUMS
+          # Bare file names, so `shasum -c SHA256SUMS` works inside the downloaded folder.
+          (cd release && sha256sum lg-hue-sync-armv7 > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         with:

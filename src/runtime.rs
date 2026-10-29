@@ -137,8 +137,21 @@ impl PendingCommands {
             || self.apply_settings.is_some()
     }
 
-    pub fn take_stop_if_running(&mut self, state: PipelineState) -> bool {
-        state == PipelineState::Running && self.desired_running.take() == Some(false)
+    /// Takes a Stop while running. A Start that lands while running with a faulted capture (a
+    /// Start in the same pass as a capture Pause) becomes a capture restart, which clears the
+    /// fault, instead of leaving the fault flag set on a running pipeline.
+    pub fn take_stop_if_running(&mut self, state: PipelineState, capture_faulted: bool) -> bool {
+        if state != PipelineState::Running {
+            return false;
+        }
+        match self.desired_running.take() {
+            Some(false) => true,
+            Some(true) if capture_faulted => {
+                self.restart = true;
+                false
+            }
+            _ => false,
+        }
     }
 
     pub fn resume_fault_for_restart(&mut self, faulted: bool) {
@@ -682,8 +695,36 @@ mod tests {
             desired_running: Some(true),
             ..PendingCommands::default()
         };
-        assert!(!pending.take_stop_if_running(PipelineState::Paused));
+        assert!(!pending.take_stop_if_running(PipelineState::Paused, true));
         assert_eq!(pending.desired_running, Some(true));
+        assert!(!pending.restart);
+    }
+
+    #[test]
+    fn running_start_after_capture_pause_restarts_and_clears_the_fault() {
+        // A capture Pause leaves a Stop request; a Start in the same pass overwrites it.
+        let mut pending = PendingCommands {
+            desired_running: Some(true),
+            ..PendingCommands::default()
+        };
+        assert!(!pending.take_stop_if_running(PipelineState::Running, true));
+        assert_eq!(pending.desired_running, None);
+        assert!(pending.restart, "the restart path clears the capture fault");
+        assert!(!pending.capture_restart_cancelled());
+
+        let mut healthy = PendingCommands {
+            desired_running: Some(true),
+            ..PendingCommands::default()
+        };
+        assert!(!healthy.take_stop_if_running(PipelineState::Running, false));
+        assert!(!healthy.restart);
+
+        let mut stop = PendingCommands {
+            desired_running: Some(false),
+            ..PendingCommands::default()
+        };
+        assert!(stop.take_stop_if_running(PipelineState::Running, true));
+        assert!(!stop.restart);
     }
 
     #[test]

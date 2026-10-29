@@ -708,16 +708,73 @@ pub async fn start_web_server(
             }
         }
     });
-    tracker.spawn(async move {
-        if let Err(error) = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-        {
-            error!("Web control server failed: {}", error);
-        }
-    });
+    tracker.spawn(serve_http(listener, app, shutdown, tracker.clone()));
     info!("[+] Web control server listening on port {}", port);
     Ok(tracker)
+}
+
+/// A client that does not send a complete request header in this time loses its socket.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Open-connection cap. Further clients wait in the kernel backlog until a socket closes.
+const MAX_CONNECTIONS: usize = 64;
+
+/// HTTP/1 accept loop. `axum::serve` gives hyper no timer, so it has no header-read timeout and
+/// no connection cap: a slowloris client could hold sockets that never reach the middleware.
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: CancellationToken,
+    tracker: TaskTracker,
+) {
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    loop {
+        let permit = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            permit = Arc::clone(&permits).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let stream = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(error) => {
+                    // Errors such as EMFILE persist; back off instead of spinning.
+                    error!("Web control server accept failed: {}", error);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
+                    }
+                }
+            },
+        };
+        let connection = builder.serve_connection(
+            hyper_util::rt::TokioIo::new(stream),
+            hyper_util::service::TowerToHyperService::new(app.clone()),
+        );
+        let shutdown = shutdown.clone();
+        tracker.spawn(async move {
+            let _permit = permit;
+            let mut connection = std::pin::pin!(connection);
+            tokio::select! {
+                result = connection.as_mut() => {
+                    if let Err(error) = result {
+                        tracing::debug!("HTTP connection ended: {error}");
+                    }
+                    return;
+                }
+                _ = shutdown.cancelled() => connection.as_mut().graceful_shutdown(),
+            }
+            if let Err(error) = connection.await {
+                tracing::debug!("HTTP connection ended during shutdown: {error}");
+            }
+        });
+    }
 }
 
 fn build_router(state: AppState) -> anyhow::Result<Router> {
@@ -1350,6 +1407,9 @@ async fn test_pattern(
     Ok(Json(StatusMessage { status: "ok" }))
 }
 
+const HUE_PAIRING_FAILED: &str =
+    "Hue pairing failed: check the bridge address and press its link button, then retry";
+
 /// Pair Hue (45-second pairing window), save credentials and queue reconfiguration.
 #[utoipa::path(
     post, path = "/api/pair/hue", tag = "LG Hue Sync",
@@ -1379,7 +1439,12 @@ async fn pair_hue(
                 validate_device_ip(&hue::discover_bridge().map_err(|error| error.to_string())?)?
             }
         };
-        let paired = hue::pair_bridge(&bridge_ip, 45).map_err(|error| error.to_string())?;
+        // One reply for every cause: distinct connect and TLS errors would let a client probe
+        // whether TCP 443 is open on any host. The log keeps the cause.
+        let paired = hue::pair_bridge(&bridge_ip, 45).map_err(|error| {
+            tracing::warn!("Hue pairing failed: {error:#}");
+            HUE_PAIRING_FAILED.to_string()
+        })?;
         Config::update(
             &config_path,
             Some(Config::new_default("", "", "", "")),
@@ -1487,6 +1552,40 @@ fn validate_device_ip(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accept_loop_serves_caps_connections_and_shuts_down_with_idle_clients() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let shutdown = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        tracker.spawn(serve_http(listener, app, shutdown.clone(), tracker.clone()));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(reply.ends_with("ok"), "{reply}");
+
+        // Idle clients up to the cap, plus one that the loop does not accept yet.
+        let mut idle = Vec::new();
+        for _ in 0..=MAX_CONNECTIONS {
+            idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        shutdown.cancel();
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tracker.wait())
+            .await
+            .expect("graceful shutdown closes idle connections");
+    }
 
     fn settings() -> LiveSettings {
         LiveSettings {
