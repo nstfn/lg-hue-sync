@@ -38,6 +38,17 @@ ls-control scan-services 2>/dev/null || true
 luna-send -n 1 -f luna://com.webos.appInstallService/dev/remove \
     '{"id":"org.webosbrew.lg-hue-sync","subscribe":false}' >/dev/null 2>&1 || true
 
+# Launcher made by scripts/install_remote_shortcut.sh. That script creates the
+# directory by hand, not through the app installer, so remove it by path. Act
+# only on the real directory (not a symlink) whose appinfo.json has its id.
+shortcut_dir=/media/developer/apps/usr/palm/applications/com.adeze.lghuesync
+if [ -d "$shortcut_dir" ] && [ ! -L "$shortcut_dir" ] \
+    && grep -q '"id": *"com.adeze.lghuesync"' "$shortcut_dir/appinfo.json" 2>/dev/null; then
+    rm -rf "$shortcut_dir"
+    luna-send -n 1 luna://com.webos.applicationManager/rescanAppList '{}' >/dev/null 2>&1 || true
+    echo "Launcher com.adeze.lghuesync removed"
+fi
+
 if [ "$PURGE_CONFIG" = false ] && [ -f "$install_dir/config.json" ]; then
     mkdir -p "$backup_dir"
     cp -p "$install_dir/config.json" "$backup_dir/config.json"

@@ -310,7 +310,7 @@ make build
 make deploy-bin TV_IP=<tv-ip>
 ```
 
-The update retains `config.json`, backs up the previous binary, uploads through a temporary filename, and restarts the service.
+The update retains `config.json`, uploads through a temporary filename and verifies its SHA-256 twice: after the upload, then again just before the swap. `scripts/swap_binary.sh` runs on the TV in one SSH command: it stops the service only for the swap and starts it again. If a step fails after the stop, it puts the previous binary back and starts it. `lg-hue-sync.previous` changes only when the running binary differs from the new one, so a second deploy of the same build keeps the older rollback copy. `./scripts/deploy.sh` uses the same swap as its last step, after the upload, Luna provisioning and IPK install, so a failure in those steps leaves the old daemon running.
 
 ## Apple Shortcuts and presets
 
@@ -377,6 +377,8 @@ the API. Process start/stop/restart remains systemd's responsibility.
 ssh root@<tv-ip> 'systemctl stop lg-hue-sync && cp /var/home/root/lg-hue-sync/lg-hue-sync.previous /var/home/root/lg-hue-sync/lg-hue-sync && chmod 755 /var/home/root/lg-hue-sync/lg-hue-sync && systemctl start lg-hue-sync'
 ```
 
+Daemon output goes to `/var/home/root/lg-hue-sync/daemon.log`, not to the journal: follow it with `make logs TV_IP=<tv-ip>`. The service allows 10 starts in 30 minutes; after that, run `systemctl reset-failed lg-hue-sync && systemctl start lg-hue-sync`. To skip the start at boot, create `/var/home/root/lg-hue-sync/DISABLE`.
+
 ## Uninstall
 
 ```bash
@@ -384,6 +386,7 @@ ssh root@<tv-ip> 'systemctl stop lg-hue-sync && cp /var/home/root/lg-hue-sync/lg
 ```
 
 Default behavior preserves `config.json` in a timestamped backup directory. Use `--purge-config` only when the owner explicitly wants credentials removed.
+Uninstall also removes the `com.adeze.lghuesync` launcher that `scripts/install_remote_shortcut.sh` creates, only when its `appinfo.json` has that id.
 
 ## Diagnostics
 
