@@ -21,7 +21,7 @@ La correction :
 | Fichier | Destination sur la TV | Rôle |
 |---|---|---|
 | `lg-hue-sync.service` | `/var/home/root/lg-hue-sync/` | Unité de base, avec `state/` |
-| `lg-hue-sync.service.d/*.conf` | `/var/home/root/lg-hue-sync/lg-hue-sync.service.d/` | Une couche de protection par fichier |
+| `lg-hue-sync.service.d/*.conf` | `/var/home/root/lg-hue-sync/lg-hue-sync.service.d/` | Une couche par fichier : protections (10 à 60), chien de garde (70) |
 | `05-lg-hue-sync` | `/var/lib/webosbrew/init.d/` | Script de démarrage (Homebrew Channel) |
 | `lg-hue-sync-log.service`, `.timer` | `/var/home/root/lg-hue-sync/` | Vidage du journal à 1 Mio, chaque minute |
 | `log-maintenance.sh` | `/var/home/root/lg-hue-sync/` | Script de vidage, chemin `state/daemon.log` |
@@ -345,6 +345,30 @@ lhs_test_end; systemctl start lg-hue-sync
 Chaque ligne montre un appel hors de `@system-service` : l'ajouter à `60-syscalls.conf` s'il est légitime.
 Si `dmesg` ne montre rien, le noyau ne journalise pas seccomp : passer au temps a.
 Un appel système refusé renvoie EPERM : chercher « Operation not permitted » dans `state/daemon.log`.
+
+### 70-watchdog : relance si le démon se fige
+
+Cette couche ne restreint rien. Elle demande au démon de signaler qu'il vit :
+- il envoie « prêt » une fois démarré, puis un signal toutes les 30 s ;
+- sans signal pendant 60 s, systemd le tue et le relance.
+
+Le code envoie déjà ces signaux (`sd_notify` dans `src/main.rs`) : il suffit de les activer. À poser en dernier, une fois les autres couches validées.
+
+```sh
+systemctl stop lg-hue-sync
+systemd-run --unit=lhs-test -p Type=notify -p NotifyAccess=main -p WatchdogSec=60s \
+  -p WorkingDirectory=$D/state -p StandardOutput=append:$D/state/daemon.log -p StandardError=inherit \
+  $D/lg-hue-sync run --config $D/state/config.json
+sleep 10; systemctl show -p Type,WatchdogUSec,ActiveState lhs-test
+# Attendu : Type=notify, WatchdogUSec=1min, ActiveState=active
+sleep 120; systemctl show -p NRestarts,ActiveState lhs-test
+# Attendu : toujours active, sans redémarrage
+lhs_test_end; systemctl start lg-hue-sync
+```
+
+Si le test passe, copier `70-watchdog.conf` dans `$D/lg-hue-sync.service.d/`, relancer le script de démarrage à la main, puis `systemctl restart lg-hue-sync`.
+
+**Retour arrière** : supprimer `70-watchdog.conf` dans `$D/lg-hue-sync.service.d/` et dans `/run/systemd/system/lg-hue-sync.service.d/`, puis `systemctl daemon-reload && systemctl restart lg-hue-sync`.
 
 ## Étape 3 : réduire les droits Luna
 
