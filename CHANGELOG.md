@@ -64,6 +64,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accept only a private (RFC 1918) or link-local IPv4 address for Nanoleaf pairing from the dashboard. Accept a Nanoleaf auth token only when it holds ASCII letters and digits, and build Nanoleaf addresses through `SocketAddr`, so an IPv6 address is always bracketed.
 - Request no webOS permissions for the launcher app (`requiredPermissions: []`). It only opens the local dashboard.
 
+## [1.1.0] - 2026-11-03
+
+### Changed
+- Use robust regional colour estimates for Hue and Nanoleaf: trim the lowest and highest 1% of weighted luminance mass, and average bright pixels instead of selecting one brightest pixel.
+- Give identified single-channel Hue fixtures wider Gaussian sampling footprints anchored to their authoritative Hue positions, with gentler independent brightness and colour response. Preserve narrow Nanoleaf 4D perimeter regions, multi-segment Hue gradient channels and legacy/manual geometry.
+- Add regional black-gate hysteresis to reduce threshold chatter while preserving Strict black and whole-screen hold/fade behaviour.
+
+### Fixed
+- Apply black-frame hold/fade only to output copies, preserving normal colour-smoothing history when picture returns.
+- Preserve brightness while smoothing between equally bright colours, and retain authoritative Gaussian centres where footprints meet screen edges.
+
+### Validation
+- Host checks cover 140 Rust tests, 9 frontend tests, Svelte diagnostics, formatting, Clippy and release metadata. Native ARMv7 builds pass ELF32, soft-float, loader and glibc <= 2.28 checks.
+- The pre-version-bump feature build was deployed with matching binary hashes, retained rollback, preserved credentials/settings, active hardware capture and both output connections. The user confirmed Hue Color Lamp 2 stays steady on a paused non-black frame with hold/fade enabled after the output-history correction.
+- Physical black-screen fade and return-to-picture behaviour remain unverified. Published daemon assets are independently built by CI; launcher-only packages and manifests remain unpublished.
+
+## [1.0.2] - 2026-11-03
+
+### Added
+- Hold the last Hue and Nanoleaf colours during whole-screen black interruptions for 750 ms, then fade to off over 2000 ms. Returning picture cancels the fade; individual dark regions retain Strict black behaviour.
+- Add independent hold/fade controls under Processing options, with validated persisted settings and backwards-compatible defaults. Set both durations to zero to disable protection; colour presets preserve them.
+- Add QSync web app installation guidance, a web manifest and embedded icons. Browser support determines installation availability; no offline cache or service worker is installed.
+
+### Fixed
+- Preserve Nanoleaf colour history when live settings resend unchanged alignment. Clear held colours on actual alignment changes, Stop, source pauses and output disable.
+
+### Validation
+- Host checks cover 134 Rust tests, 9 frontend tests, Svelte diagnostics, formatting, Clippy and release metadata. Native ARMv7 builds pass ELF32, soft-float, loader and glibc <= 2.28 checks.
+- The pre-version-bump feature build was installed on the TV with matching binary hashes, a retained rollback binary, active hardware capture and both output connections. Configuration changed only to add the two new timing defaults. Physical fade behaviour remains unverified.
+- Published daemon assets are independently built by Docker CI; launcher-only packages and manifests remain unpublished.
+
+## [1.0.1] - 2026-10-30
+
+### Changed
+- Rebuild the embedded dashboard with Svelte, Tailwind and selected shadcn-svelte components; keep the existing local HTTP API and single-file deployment.
+- Use consistent Item rows and touch-sized Switches for processing/device settings, with pressed Toggles for screen sync, display and light regions.
+- Make Colour, Response and Spatial preset groups independently combinable, automatically save selections, and restore the last saved choices.
+- Add bounded Off/Mild/Strong depth influence while preserving Hue channel centres and separate gradient-channel sampling.
+- Combine capture polling ceiling, measured light-update rate and sender connection status into one diagnostic gauge; distinguish paused, stale and unavailable readings.
+
+### Fixed
+- Add display-only on/off/toggle HTTP controls and pause screen synchronization while the display is off, independently of TV standby power.
+- Keep tuning preview capture explicit and frozen; remove live polling from colour tuning and avoid redundant settings updates.
+- Use practical fader/output-trim steps, place Strict black with Black gate, and group infrequent processing options separately.
+- Harden atomic configuration writes and preserve independent preset overrides and device credentials.
+
+### Validation
+- Host checks cover 127 Rust tests, 9 frontend tests, Svelte diagnostics, formatting, Clippy and release metadata. Native ARMv7 builds pass ELF32, soft-float, loader and glibc <= 2.28 checks.
+- The pre-version-bump UX build was deployed and its binary hash, service, dashboard, hardware capture and Hue/Nanoleaf connections verified. Physical colour accuracy and iPhone haptics were not measured.
+- HLS, native video encoding and audio interception are excluded. CI builds published daemon assets independently; launcher-only packages/manifests remain unpublished.
+
 ## [1.0.0] - 2026-10-29
 
 ### Added

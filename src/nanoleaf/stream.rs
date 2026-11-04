@@ -114,9 +114,11 @@ pub struct PerimeterZone {
 pub struct NanoleafPerimeterSampler {
     base_zones: Vec<PerimeterZone>,
     zones: Vec<PerimeterZone>,
+    alignment: Option<NanoleafAlignment>,
     smoothed_colors: Vec<FloatColor>,
     active_rect: Option<ActiveRect>,
     processor: ColorProcessor,
+    black_frame: crate::color::black_frame::BlackFrameGuard,
     brightness_multiplier: f32,
     last_sample: Option<Instant>,
 }
@@ -165,6 +167,7 @@ impl NanoleafPerimeterSampler {
         let mut sampler = Self {
             base_zones,
             zones: Vec::new(),
+            alignment: None,
             smoothed_colors: Vec::new(),
             active_rect: None,
             processor: ColorProcessor::new(
@@ -174,6 +177,7 @@ impl NanoleafPerimeterSampler {
                 noise_gate_threshold,
             ),
             brightness_multiplier,
+            black_frame: Default::default(),
             last_sample: None,
         };
         sampler.set_alignment(alignment);
@@ -181,6 +185,10 @@ impl NanoleafPerimeterSampler {
     }
 
     pub fn set_alignment(&mut self, alignment: NanoleafAlignment) {
+        // Live settings resend alignment even when only unrelated tuning changed.
+        if self.alignment == Some(alignment) {
+            return;
+        }
         let len = self.base_zones.len();
         if len == 0 {
             return;
@@ -209,6 +217,8 @@ impl NanoleafPerimeterSampler {
             })
             .collect();
         self.smoothed_colors = vec![FloatColor::default(); len];
+        self.alignment = Some(alignment);
+        self.black_frame.reset();
         self.last_sample = None;
     }
 
@@ -468,8 +478,18 @@ impl NanoleafPerimeterSampler {
         self.processor.set_strict_blackout(enabled);
     }
 
+    pub fn set_black_frame_timing(&mut self, hold_ms: u32, fade_ms: u32) {
+        self.black_frame.configure(hold_ms, fade_ms);
+    }
+
+    pub fn reset_black_frame(&mut self) {
+        self.black_frame.reset();
+        self.smoothed_colors.fill(FloatColor::default());
+        self.last_sample = None;
+    }
+
     pub fn set_brightness_multiplier(&mut self, mult: f32) {
-        self.brightness_multiplier = mult.clamp(0.1, 4.0);
+        self.brightness_multiplier = mult.clamp(0.0, 6.25);
     }
 
     pub fn set_saturation_boost(&mut self, boost: f32) {
@@ -516,14 +536,19 @@ impl NanoleafPerimeterSampler {
             .replace(now)
             .map(|last| now.duration_since(last))
             .unwrap_or(REFERENCE_FRAME);
+        let mut output = self.smoothed_colors.clone();
+        if self
+            .black_frame
+            .apply(frame_data, width, height, &mut output, now)
+        {
+            return self.output_colors(output);
+        }
         let (act_x_min, act_x_max, act_y_min, act_y_max) = match self.active_rect {
             Some(rect) => (rect.x_min, rect.x_max, rect.y_min, rect.y_max),
             None => (0.0, 1.0, 0.0, 1.0),
         };
         let act_x_range = (act_x_max - act_x_min).max(0.1);
         let act_y_range = (act_y_max - act_y_min).max(0.1);
-
-        let mut result = Vec::with_capacity(self.zones.len());
 
         for (i, zone) in self.zones.iter().enumerate() {
             // Remap normalized coordinates to active letterbox area
@@ -541,12 +566,7 @@ impl NanoleafPerimeterSampler {
                 .min(height)
                 .max(y_start + 1);
 
-            let mut weighted_r = 0.0f32;
-            let mut weighted_g = 0.0f32;
-            let mut weighted_b = 0.0f32;
-            let mut total_weight = 0.0f32;
-            let mut peak_pixel = RgbColor::new(0, 0, 0);
-            let mut max_luma = 0.0f32;
+            let mut region = crate::color::sampling::RegionSample::default();
 
             // 2x2 spatial subsampling for zero-lag 60 FPS performance
             for y in (y_start..y_end).step_by(2) {
@@ -564,45 +584,32 @@ impl NanoleafPerimeterSampler {
                     };
 
                     let pix = RgbColor::new(r_raw, g_raw, b_raw);
-                    let luma = pix.luminance();
-                    if luma > max_luma {
-                        max_luma = luma;
-                        peak_pixel = pix;
-                    }
 
                     let weight = self.processor.sample_weight(pix.chroma());
 
-                    weighted_r += (r_raw as f32) * weight;
-                    weighted_g += (g_raw as f32) * weight;
-                    weighted_b += (b_raw as f32) * weight;
-                    total_weight += weight;
+                    region.add(pix, weight);
                 }
             }
 
-            let mean_color = if total_weight > 0.0 {
-                FloatColor::new(
-                    (weighted_r / total_weight).clamp(0.0, 255.0),
-                    (weighted_g / total_weight).clamp(0.0, 255.0),
-                    (weighted_b / total_weight).clamp(0.0, 255.0),
-                )
-            } else {
-                FloatColor::default()
-            };
+            let (mean_color, highlight, max_luma) = region.finish();
 
             let current = self.smoothed_colors[i];
             let smoothed = self.processor.process(
                 mean_color,
-                peak_pixel.into(),
+                highlight,
                 max_luma,
                 current,
                 is_scene_cut,
                 elapsed,
             );
             self.smoothed_colors[i] = smoothed;
-
-            result.push(smoothed);
         }
 
+        output.clone_from(&self.smoothed_colors);
+        self.output_colors(output)
+    }
+
+    fn output_colors(&self, mut result: Vec<FloatColor>) -> Vec<RgbColor> {
         self.processor.blend_spatial(&mut result, |i| {
             let z = &self.zones[i];
             ((z.x_min + z.x_max) * 0.5, (z.y_min + z.y_max) * 0.5)
@@ -616,6 +623,46 @@ impl NanoleafPerimeterSampler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_screen_black_holds_nanoleaf_colours_with_output_trim_and_resets() {
+        let mut sampler = NanoleafPerimeterSampler::new(4, &[1, 2, 3, 4], false, 1.0, 0.02, 0.5);
+        sampler.set_strict_blackout(true);
+        sampler.set_black_frame_timing(750, 2000);
+        sampler
+            .smoothed_colors
+            .fill(FloatColor::new(80.0, 40.0, 20.0));
+        let held = sampler.sample_frame(&[0; 64], 4, 4, false, true);
+        assert_eq!(held, vec![RgbColor::new(40, 20, 10); 4]);
+        sampler.set_black_frame_timing(0, 1);
+        sampler.sample_frame(&[0; 64], 4, 4, false, false);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert_eq!(
+            sampler.sample_frame(&[0; 64], 4, 4, false, false),
+            vec![RgbColor::new(0, 0, 0); 4]
+        );
+        assert_eq!(
+            sampler.smoothed_colors,
+            vec![FloatColor::new(80.0, 40.0, 20.0); 4]
+        );
+        sampler.set_alignment(NanoleafAlignment::default());
+        sampler.set_black_frame_timing(1000, 3000);
+        assert_eq!(sampler.sample_frame(&[0; 64], 4, 4, false, true), held);
+        sampler.set_alignment(NanoleafAlignment {
+            perimeter_offset: 1,
+            ..NanoleafAlignment::default()
+        });
+        assert_eq!(
+            sampler.sample_frame(&[0; 64], 4, 4, false, true),
+            vec![RgbColor::new(0, 0, 0); 4]
+        );
+        sampler
+            .smoothed_colors
+            .fill(FloatColor::new(80.0, 40.0, 20.0));
+        sampler.reset_black_frame();
+        let black = sampler.sample_frame(&[0; 64], 4, 4, true, false);
+        assert_eq!(black, vec![RgbColor::new(0, 0, 0); 4]);
+    }
+
     use super::*;
 
     #[test]
@@ -657,9 +704,9 @@ mod tests {
         let panel_ids = vec![1, 2, 3, 4];
         let mut sampler = NanoleafPerimeterSampler::new(4, &panel_ids, false, 1.0, 0.02, 1.0);
         sampler.set_strict_blackout(true);
-        sampler.sample_frame(&vec![255; 64], 4, 4, false, false);
+        sampler.sample_frame(&[255; 64], 4, 4, false, false);
 
-        let colors = sampler.sample_frame(&vec![0; 64], 4, 4, false, false);
+        let colors = sampler.sample_frame(&[0; 64], 4, 4, false, false);
         assert!(colors.iter().all(|color| *color == RgbColor::new(0, 0, 0)));
     }
 
@@ -698,12 +745,24 @@ mod tests {
     }
 
     #[test]
+    fn output_trim_supports_zero_and_combined_gain() {
+        let mut sampler = NanoleafPerimeterSampler::new(4, &[1, 2, 3, 4], false, 1.0, 0.0, 1.0);
+        sampler.set_brightness_multiplier(0.0);
+        let colors = sampler.sample_frame(&[255, 0, 0, 255].repeat(16), 4, 4, false, true);
+        assert!(colors
+            .iter()
+            .all(|color| color.r == 0 && color.g == 0 && color.b == 0));
+        sampler.set_brightness_multiplier(2.5 * 2.5);
+        assert_eq!(sampler.brightness_multiplier, 6.25);
+    }
+
+    #[test]
     fn test_nanoleaf_scene_cut_respects_limiter() {
         let panel_ids = vec![1u16, 2u16, 3u16, 4u16];
         let mut sampler = NanoleafPerimeterSampler::new(4, &panel_ids, false, 1.0, 0.0, 1.0);
 
         // Synthetic 4x4 frame of bright red (RGBA)
-        let red_frame = vec![255, 0, 0, 255].repeat(16);
+        let red_frame = [255, 0, 0, 255].repeat(16);
 
         // Scene cuts bypass EMA and move 4x the normal step, but stay under the flash-safety limiter.
         let colors = sampler.sample_frame(&red_frame, 4, 4, false, true);
@@ -754,7 +813,7 @@ mod tests {
         sampler.set_max_color_step(255);
 
         // Synthetic 4x4 frame with blue color
-        let blue_frame = vec![0, 0, 255, 255].repeat(16);
+        let blue_frame = [0, 0, 255, 255].repeat(16);
         let colors = sampler.sample_frame(&blue_frame, 4, 4, false, true);
         assert_eq!(colors.len(), 40);
         for c in &colors {

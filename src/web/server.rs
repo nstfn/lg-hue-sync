@@ -52,35 +52,47 @@ pub struct LiveSettings {
     #[schema(minimum = 0.5, maximum = 2.5)]
     pub brightness_multiplier: f32,
     #[serde(default = "default_output_trim")]
-    #[schema(minimum = 0.25, maximum = 2, default = 1.0)]
+    #[schema(minimum = 0, maximum = 2.5, default = 1.0)]
     pub hue_output_brightness: f32,
     #[serde(default = "default_output_trim")]
-    #[schema(minimum = 0.25, maximum = 2, default = 1.0)]
+    #[schema(minimum = 0, maximum = 2.5, default = 1.0)]
     pub nanoleaf_output_brightness: f32,
-    #[schema(minimum = 1, maximum = 2.5)]
+    #[schema(minimum = 0.5, maximum = 2.5)]
     pub saturation_boost: f32,
-    #[schema(minimum = 0, maximum = 0.8)]
+    #[schema(minimum = 0, maximum = 1)]
     pub peak_weight: f32,
     /// Nearby-zone gradient blending, 0 (off) to 0.5.
     #[serde(default)]
     #[schema(minimum = 0, maximum = 0.5, default = 0.0)]
     pub spatial_blend: f32,
-    #[schema(minimum = 0.8, maximum = 2)]
+    /// Bounded Hue footprint expansion, independent of neighbour blending.
+    #[serde(default = "crate::config::default_depth_influence")]
+    #[schema(minimum = 0, maximum = 1, default = 0.5)]
+    pub depth_influence: f32,
+    #[schema(minimum = 0.5, maximum = 2)]
     pub gamma: f32,
     #[schema(minimum = 0, maximum = 0.06)]
     pub noise_gate_threshold: f32,
     #[serde(default = "default_smoothing_factor")]
-    #[schema(minimum = 0.05, maximum = 0.8, default = 0.35)]
+    #[schema(minimum = 0.05, maximum = 1, default = 0.35)]
     pub smoothing_factor: f32,
     #[serde(default = "default_smoothing_factor")]
-    #[schema(minimum = 0.05, maximum = 0.8, default = 0.35)]
+    #[schema(minimum = 0.05, maximum = 1, default = 0.35)]
     pub rise_smoothing_factor: f32,
     #[serde(default = "default_smoothing_factor")]
-    #[schema(minimum = 0.05, maximum = 0.8, default = 0.35)]
+    #[schema(minimum = 0.05, maximum = 1, default = 0.35)]
     pub fall_smoothing_factor: f32,
     #[serde(default)]
     #[schema(default = false)]
     pub strict_blackout: bool,
+    /// Hold the last colours during a whole-screen black interruption.
+    #[serde(default = "crate::config::default_black_frame_hold_ms")]
+    #[schema(minimum = 0, maximum = 5000, default = 750)]
+    pub black_frame_hold_ms: u32,
+    /// Fade to black after the hold; both durations zero disables protection.
+    #[serde(default = "crate::config::default_black_frame_fade_ms")]
+    #[schema(minimum = 0, maximum = 10000, default = 2000)]
+    pub black_frame_fade_ms: u32,
     pub use_xy_gamut: bool,
     pub letterbox_detection: bool,
     pub hdr_tone_mapping: bool,
@@ -119,32 +131,33 @@ impl LiveSettings {
             (
                 "hue_output_brightness",
                 self.hue_output_brightness,
-                0.25,
-                2.0,
+                0.0,
+                2.5,
             ),
             (
                 "nanoleaf_output_brightness",
                 self.nanoleaf_output_brightness,
-                0.25,
-                2.0,
+                0.0,
+                2.5,
             ),
-            ("saturation_boost", self.saturation_boost, 1.0, 2.5),
-            ("peak_weight", self.peak_weight, 0.0, 0.8),
+            ("saturation_boost", self.saturation_boost, 0.5, 2.5),
+            ("peak_weight", self.peak_weight, 0.0, 1.0),
             ("spatial_blend", self.spatial_blend, 0.0, 0.5),
-            ("gamma", self.gamma, 0.8, 2.0),
+            ("depth_influence", self.depth_influence, 0.0, 1.0),
+            ("gamma", self.gamma, 0.5, 2.0),
             ("noise_gate_threshold", self.noise_gate_threshold, 0.0, 0.06),
-            ("smoothing_factor", self.smoothing_factor, 0.05, 0.8),
+            ("smoothing_factor", self.smoothing_factor, 0.05, 1.0),
             (
                 "rise_smoothing_factor",
                 self.rise_smoothing_factor,
                 0.05,
-                0.8,
+                1.0,
             ),
             (
                 "fall_smoothing_factor",
                 self.fall_smoothing_factor,
                 0.05,
-                0.8,
+                1.0,
             ),
         ];
         for (name, value, min, max) in ranges {
@@ -153,6 +166,11 @@ impl LiveSettings {
                     "{name} must be between {min} and {max}"
                 )));
             }
+        }
+        if self.black_frame_hold_ms > 5000 || self.black_frame_fade_ms > 10000 {
+            return Err(ApiError::BadRequest(
+                "black_frame_hold_ms must be between 0 and 5000; black_frame_fade_ms must be between 0 and 10000".to_string(),
+            ));
         }
         if !(4..=64).contains(&self.max_color_step) {
             return Err(ApiError::BadRequest(
@@ -188,21 +206,14 @@ impl PresetTuning {
         }
     }
 
+    // Response fields stay readable in older saved files; colour recall uses global response.
     fn apply(&self, settings: &mut LiveSettings) {
         settings.brightness_multiplier = self.brightness_multiplier;
         settings.saturation_boost = self.saturation_boost;
         settings.peak_weight = self.peak_weight;
-        settings.spatial_blend = self.spatial_blend;
         settings.gamma = self.gamma;
         settings.noise_gate_threshold = self.noise_gate_threshold;
-        settings.smoothing_factor = self.smoothing_factor;
-        settings.rise_smoothing_factor = self.rise_smoothing_factor;
-        settings.fall_smoothing_factor = self.fall_smoothing_factor;
         settings.strict_blackout = self.strict_blackout;
-        settings.max_color_step = self.max_color_step;
-        settings.use_xy_gamut = self.use_xy_gamut;
-        settings.letterbox_detection = self.letterbox_detection;
-        settings.hdr_tone_mapping = self.hdr_tone_mapping;
     }
 }
 
@@ -218,11 +229,14 @@ struct Preset {
     strict_blackout: bool,
     max_color_step: u8,
     spatial_blend: f32,
+    preserve_response: bool,
 }
 
 impl Preset {
     fn named(name: &str) -> Result<Self, ApiError> {
         let values = match name {
+            "softColor" => (0.85, 0.75, 0.1, 0.95, 0.02, 0.35, 0.35, 0.35, false, 12),
+            "vividColor" => (1.1, 1.8, 0.4, 1.1, 0.025, 0.35, 0.35, 0.35, true, 12),
             "neutral" => (1.0, 1.0, 0.15, 1.0, 0.02, 0.35, 0.35, 0.35, false, 12),
             "highChroma" => (1.05, 1.65, 0.25, 1.0, 0.015, 0.4, 0.35, 0.4, false, 12),
             "neonContrast" => (1.0, 2.0, 0.45, 1.15, 0.035, 0.55, 0.45, 0.7, true, 10),
@@ -232,6 +246,7 @@ impl Preset {
             _ => return Err(ApiError::BadRequest(format!("Unknown preset: {name}"))),
         };
         Ok(Self {
+            preserve_response: !matches!(name, "fastResponse" | "lowStimulation"),
             brightness: values.0,
             saturation: values.1,
             peak: values.2,
@@ -243,7 +258,7 @@ impl Preset {
             strict_blackout: values.8,
             max_color_step: values.9,
             spatial_blend: match name {
-                "neutral" | "fastResponse" => 0.0,
+                "softColor" | "neutral" | "vividColor" | "fastResponse" => 0.0,
                 "highChroma" => 0.15,
                 "neonContrast" => 0.08,
                 "darkSceneDetail" => 0.1,
@@ -259,15 +274,19 @@ impl Preset {
         settings.peak_weight = self.peak;
         settings.gamma = self.gamma;
         settings.noise_gate_threshold = self.black_gate;
-        settings.smoothing_factor = self.smoothing;
-        settings.rise_smoothing_factor = self.rise;
-        settings.fall_smoothing_factor = self.fall;
+        if !self.preserve_response {
+            settings.smoothing_factor = self.smoothing;
+            settings.rise_smoothing_factor = self.rise;
+            settings.fall_smoothing_factor = self.fall;
+            settings.max_color_step = self.max_color_step;
+            settings.spatial_blend = self.spatial_blend;
+        }
         settings.strict_blackout = self.strict_blackout;
-        settings.max_color_step = self.max_color_step;
-        settings.spatial_blend = self.spatial_blend;
-        settings.use_xy_gamut = false;
-        settings.letterbox_detection = true;
-        settings.hdr_tone_mapping = true;
+        if !self.preserve_response {
+            settings.use_xy_gamut = false;
+            settings.letterbox_detection = true;
+            settings.hdr_tone_mapping = true;
+        }
     }
 }
 
@@ -344,6 +363,8 @@ impl SyncStatus {
 }
 
 pub struct SharedState {
+    display_control: Mutex<()>,
+    pub display_off: AtomicBool,
     active_preset: RwLock<Option<String>>,
     saved_presets: RwLock<BTreeMap<String, PresetTuning>>,
     pub preview: PreviewState,
@@ -386,6 +407,8 @@ impl SharedState {
         command_tx: mpsc::Sender<ControlCommand>,
     ) -> Self {
         Self {
+            display_control: Mutex::new(()),
+            display_off: AtomicBool::new(false),
             active_preset: RwLock::new(None),
             saved_presets: RwLock::new(BTreeMap::new()),
             preview: PreviewState::default(),
@@ -467,8 +490,12 @@ impl SharedState {
         };
         let saved = self.saved_presets.read().unwrap().get(&name).cloned();
         let reference = saved.or_else(|| self.factory_tuning(&name).ok());
-        let current = PresetTuning::capture(&self.current_settings.read().unwrap());
-        reference.is_some_and(|reference| reference != current)
+        let current = self.current_settings.read().unwrap().clone();
+        reference.is_some_and(|reference| {
+            let mut recalled = current.clone();
+            reference.apply(&mut recalled);
+            PresetTuning::capture(&recalled) != PresetTuning::capture(&current)
+        })
     }
 
     async fn select_preset(&self, name: String, reset: bool) -> Result<(), ApiError> {
@@ -702,6 +729,12 @@ pub async fn start_web_server(
                 }
             };
             *shared.diagnostics.write().unwrap() = snapshot;
+            {
+                let _guard = shared.display_control.lock().await;
+                if let Ok(Some(enabled)) = crate::tv_power::display_enabled().await {
+                    shared.display_off.store(!enabled, Ordering::Relaxed);
+                }
+            }
             tokio::select! {
                 _ = diagnostics_shutdown.cancelled() => break,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
@@ -780,6 +813,8 @@ async fn serve_http(
 fn build_router(state: AppState) -> anyhow::Result<Router> {
     let (router, mut document) = OpenApiRouter::<AppState>::new()
         .routes(routes!(status))
+        .routes(routes!(display_status))
+        .routes(routes!(display_control))
         .routes(routes!(preview_frame))
         .merge(
             OpenApiRouter::new()
@@ -811,6 +846,63 @@ fn build_router(state: AppState) -> anyhow::Result<Router> {
     Ok(router
         .route("/", get(root))
         .route("/index.html", get(root))
+        .route(
+            "/manifest.webmanifest",
+            get(|| async {
+                embedded_asset(
+                    "application/manifest+json",
+                    include_bytes!("../../frontend/public/manifest.webmanifest"),
+                )
+            }),
+        )
+        .route(
+            "/favicon.svg",
+            get(|| async {
+                embedded_asset(
+                    "image/svg+xml",
+                    include_bytes!("../../frontend/public/favicon.svg"),
+                )
+            }),
+        )
+        .route(
+            "/icon-192.png",
+            get(|| async {
+                embedded_asset(
+                    "image/png",
+                    include_bytes!("../../frontend/public/icon-192.png"),
+                )
+            }),
+        )
+        .route(
+            "/icon-512.png",
+            get(|| async {
+                embedded_asset(
+                    "image/png",
+                    include_bytes!("../../frontend/public/icon-512.png"),
+                )
+            }),
+        )
+        .route(
+            "/apple-touch-icon.png",
+            get(|| async {
+                embedded_asset(
+                    "image/png",
+                    include_bytes!("../../frontend/public/apple-touch-icon.png"),
+                )
+            }),
+        )
+        .route(
+            "/assets/ios-haptics-3.3.0.js",
+            get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/javascript; charset=utf-8",
+                    )],
+                    include_str!("vendor/ios-haptics-3.3.0.js"),
+                )
+            }),
+        )
         .route("/capture-patterns", get(capture_patterns))
         .route(
             "/openapi.json",
@@ -832,6 +924,16 @@ fn build_router(state: AppState) -> anyhow::Result<Router> {
 
 async fn root() -> Html<&'static str> {
     Html(EMBEDDED_UI_HTML)
+}
+
+fn embedded_asset(content_type: &'static str, bytes: &'static [u8]) -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        bytes,
+    )
 }
 
 async fn capture_patterns() -> Html<&'static str> {
@@ -1040,6 +1142,67 @@ async fn set_bonjour(
     Ok(Json(request))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+struct DisplayState {
+    /// Actual panel state; null means standby or an unrecognized state.
+    enabled: Option<bool>,
+}
+
+/// Read the panel state separately from TV standby.
+#[utoipa::path(get, path = "/api/display", tag = "LG Hue Sync",
+    responses((status = 200, body = DisplayState), (status = 502, body = ErrorResponse)))]
+async fn display_status(State(state): State<AppState>) -> Result<Json<DisplayState>, ApiError> {
+    let _guard = state.shared.display_control.lock().await;
+    let enabled = crate::tv_power::display_enabled()
+        .await
+        .map_err(|error| ApiError::SetupFailed(error.to_string()))?;
+    if let Some(enabled) = enabled {
+        state.shared.display_off.store(!enabled, Ordering::Relaxed);
+    }
+    Ok(Json(DisplayState { enabled }))
+}
+
+/// Set or toggle the panel without powering the TV on or off.
+#[utoipa::path(post, path = "/api/display/{action}", tag = "LG Hue Sync",
+    params(("action" = String, Path, description = "on, off or toggle; toggle is not retry-safe")),
+    responses((status = 200, body = DisplayState), (status = 400, body = ErrorResponse),
+        (status = 502, body = ErrorResponse)))]
+async fn display_control(
+    State(state): State<AppState>,
+    Path(action): Path<String>,
+) -> Result<Json<DisplayState>, ApiError> {
+    if !matches!(action.as_str(), "on" | "off" | "toggle") {
+        return Err(ApiError::BadRequest(
+            "Display action must be on, off or toggle".into(),
+        ));
+    }
+    let _guard = state.shared.display_control.lock().await;
+    let current = crate::tv_power::display_enabled()
+        .await
+        .map_err(|error| ApiError::SetupFailed(error.to_string()))?
+        .ok_or_else(|| {
+            ApiError::SetupFailed(
+                "Display control unavailable in standby or unknown TV state".into(),
+            )
+        })?;
+    let enabled = match action.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => !current,
+    };
+    let actual = if enabled == current {
+        Some(current)
+    } else {
+        crate::tv_power::set_display(enabled)
+            .await
+            .map_err(|error| ApiError::SetupFailed(error.to_string()))?
+    };
+    if let Some(enabled) = actual {
+        state.shared.display_off.store(!enabled, Ordering::Relaxed);
+    }
+    Ok(Json(DisplayState { enabled: actual }))
+}
+
 /// Queue capture and output start.
 #[utoipa::path(
     post, path = "/api/start", tag = "LG Hue Sync",
@@ -1110,10 +1273,10 @@ async fn settings(
     Ok(Json(StatusMessage { status: "ok" }))
 }
 
-/// Apply a named color preset without saving configuration.
+/// Apply a color preset while preserving temporal response; legacy fastResponse/lowStimulation names remain full profiles.
 #[utoipa::path(
     post, path = "/api/presets/{name}", tag = "LG Hue Sync",
-    params(("name" = String, Path, pattern = "^(neutral|highChroma|neonContrast|darkSceneDetail|fastResponse|lowStimulation)$")),
+    params(("name" = String, Path, pattern = "^(softColor|neutral|vividColor|highChroma|neonContrast|darkSceneDetail|fastResponse|lowStimulation)$")),
     responses(
         (status = 200, description = "Success", body = StatusMessage),
         (status = 400, description = "Invalid request", content((ErrorResponse = "application/json"), (String = "text/plain"))),
@@ -1587,6 +1750,61 @@ mod tests {
             .expect("graceful shutdown closes idle connections");
     }
 
+    #[test]
+    fn black_frame_settings_default_validate_and_survive_colour_presets() {
+        let mut value = serde_json::to_value(settings()).unwrap();
+        value.as_object_mut().unwrap().remove("black_frame_hold_ms");
+        value.as_object_mut().unwrap().remove("black_frame_fade_ms");
+        let mut input: LiveSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            (input.black_frame_hold_ms, input.black_frame_fade_ms),
+            (750, 2000)
+        );
+        for (hold, fade, valid) in [
+            (0, 0, true),
+            (5000, 10000, true),
+            (5001, 10000, false),
+            (5000, 10001, false),
+        ] {
+            input.black_frame_hold_ms = hold;
+            input.black_frame_fade_ms = fade;
+            assert_eq!(input.validate().is_ok(), valid);
+        }
+        input.black_frame_hold_ms = 1500;
+        input.black_frame_fade_ms = 3000;
+        Preset::named("neonContrast").unwrap().apply(&mut input);
+        assert_eq!(
+            (input.black_frame_hold_ms, input.black_frame_fade_ms),
+            (1500, 3000)
+        );
+
+        let mut config = serde_json::to_value(Config::new_default(
+            "fixture", "fixture", "fixture", "fixture",
+        ))
+        .unwrap();
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("black_frame_hold_ms");
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("black_frame_fade_ms");
+        let mut config: Config = serde_json::from_value(config).unwrap();
+        assert_eq!(
+            (config.black_frame_hold_ms, config.black_frame_fade_ms),
+            (750, 2000)
+        );
+        config.black_frame_hold_ms = input.black_frame_hold_ms;
+        config.black_frame_fade_ms = input.black_frame_fade_ms;
+        let restored: Config =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(
+            (restored.black_frame_hold_ms, restored.black_frame_fade_ms),
+            (1500, 3000)
+        );
+    }
+
     fn settings() -> LiveSettings {
         LiveSettings {
             brightness_multiplier: 1.0,
@@ -1595,12 +1813,15 @@ mod tests {
             saturation_boost: 1.5,
             peak_weight: 0.35,
             spatial_blend: 0.0,
+            depth_influence: crate::config::default_depth_influence(),
             gamma: 1.0,
             noise_gate_threshold: 0.02,
             smoothing_factor: 0.35,
             rise_smoothing_factor: 0.35,
             fall_smoothing_factor: 0.35,
             strict_blackout: false,
+            black_frame_hold_ms: crate::config::default_black_frame_hold_ms(),
+            black_frame_fade_ms: crate::config::default_black_frame_fade_ms(),
             use_xy_gamut: false,
             letterbox_detection: true,
             hdr_tone_mapping: false,
@@ -1631,6 +1852,62 @@ mod tests {
             .unwrap(),
             receiver,
         )
+    }
+
+    #[tokio::test]
+    async fn pwa_assets_are_embedded_with_correct_types_and_revalidation() {
+        use tower::ServiceExt;
+        let (app, _receiver) = test_router();
+        for (path, content_type, expected) in [
+            (
+                "/manifest.webmanifest",
+                "application/manifest+json",
+                include_bytes!("../../frontend/public/manifest.webmanifest").as_slice(),
+            ),
+            (
+                "/favicon.svg",
+                "image/svg+xml",
+                include_bytes!("../../frontend/public/favicon.svg").as_slice(),
+            ),
+            (
+                "/icon-192.png",
+                "image/png",
+                include_bytes!("../../frontend/public/icon-192.png").as_slice(),
+            ),
+            (
+                "/icon-512.png",
+                "image/png",
+                include_bytes!("../../frontend/public/icon-512.png").as_slice(),
+            ),
+            (
+                "/apple-touch-icon.png",
+                "image/png",
+                include_bytes!("../../frontend/public/apple-touch-icon.png").as_slice(),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["content-type"], content_type, "{path}");
+            assert_eq!(response.headers()["cache-control"], "no-cache", "{path}");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected, "{path}");
+            if path == "/manifest.webmanifest" {
+                let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(manifest["name"], "QSync");
+                assert_eq!(manifest["display"], "standalone");
+            }
+        }
     }
 
     #[tokio::test]
@@ -2004,9 +2281,11 @@ mod tests {
         let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
         let paths = document["paths"].as_object().unwrap();
-        assert_eq!(paths.len(), 19);
+        assert_eq!(paths.len(), 21);
         for (path, method) in [
             ("/api/status", "get"),
+            ("/api/display", "get"),
+            ("/api/display/{action}", "post"),
             ("/api/preview/frame", "get"),
             ("/api/preview/render", "post"),
             ("/api/bonjour", "post"),
@@ -2033,7 +2312,7 @@ mod tests {
             .is_some());
         let schemas = &document["components"]["schemas"];
         let live = &schemas["LiveSettings"];
-        assert_eq!(live["properties"]["gamma"]["minimum"], 0.8);
+        assert_eq!(live["properties"]["gamma"]["minimum"], 0.5);
         assert_eq!(live["properties"]["gamma"]["maximum"], 2.0);
         assert!(live["required"]
             .as_array()
@@ -2082,6 +2361,42 @@ mod tests {
         assert!(status.get("sync").is_none());
         assert_eq!(status["diagnostics"]["sampled_unix_ms"], 0);
         assert_eq!(status["diagnostics"]["video"]["available"], false);
+    }
+
+    #[test]
+    fn coarse_tuning_range_extremes_validate() {
+        let mut settings = settings();
+        settings.hue_output_brightness = 0.0;
+        settings.nanoleaf_output_brightness = 2.5;
+        assert!(settings.validate().is_ok());
+        settings.hue_output_brightness = 2.5;
+        settings.nanoleaf_output_brightness = 0.0;
+        settings.saturation_boost = 0.5;
+        settings.gamma = 0.5;
+        settings.peak_weight = 1.0;
+        settings.smoothing_factor = 1.0;
+        settings.rise_smoothing_factor = 1.0;
+        settings.fall_smoothing_factor = 1.0;
+        assert!(settings.validate().is_ok());
+        settings.saturation_boost = 0.49;
+        assert!(settings.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn display_rejects_unknown_actions_without_device_access() {
+        use tower::ServiceExt;
+        let (app, _) = test_router();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/display/power-off")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2220,9 +2535,9 @@ mod tests {
     fn preset_changes_only_shared_color_controls() {
         for (name, blend) in [
             ("neutral", 0.0),
-            ("highChroma", 0.15),
-            ("neonContrast", 0.08),
-            ("darkSceneDetail", 0.1),
+            ("highChroma", 0.0),
+            ("neonContrast", 0.0),
+            ("darkSceneDetail", 0.0),
             ("fastResponse", 0.0),
             ("lowStimulation", 0.3),
         ] {
@@ -2239,8 +2554,8 @@ mod tests {
         input.spatial_blend = 0.25;
         Preset::named("neonContrast").unwrap().apply(&mut input);
         assert_eq!(input.saturation_boost, 2.0);
-        assert_eq!(input.spatial_blend, 0.08);
-        assert_eq!(input.rise_smoothing_factor, 0.45);
+        assert_eq!(input.spatial_blend, 0.25);
+        assert_eq!(input.rise_smoothing_factor, 0.35);
         assert!(input.strict_blackout);
         assert_eq!(input.hue_output_brightness, 0.7);
         assert_eq!(input.nanoleaf_output_brightness, 0.8);
@@ -2360,6 +2675,76 @@ mod tests {
         assert!(!snapshot.requested_running);
         assert_eq!(snapshot.pipeline_state, SyncState::Faulted);
         assert_eq!(snapshot.last_error.as_deref(), Some("capture busy"));
+    }
+
+    #[tokio::test]
+    async fn color_presets_preserve_independent_response() {
+        let defaults = Config::new_default("", "", "", "");
+        assert_eq!(defaults.active_preset.as_deref(), Some("neutral"));
+        assert_eq!(
+            (
+                defaults.saturation_boost,
+                defaults.spatial_blend,
+                defaults.smoothing_factor
+            ),
+            (1.0, 0.15, 0.35)
+        );
+        let (sender, mut receiver) = mpsc::channel(8);
+        let shared = SharedState::new(
+            settings(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            sender,
+        );
+        shared
+            .select_preset("neonContrast".into(), false)
+            .await
+            .unwrap();
+        receiver.recv().await.unwrap();
+        let mut slow = shared.current_settings.read().unwrap().clone();
+        slow.smoothing_factor = 0.2;
+        slow.rise_smoothing_factor = 0.18;
+        slow.fall_smoothing_factor = 0.22;
+        slow.max_color_step = 6;
+        slow.spatial_blend = 0.3;
+        shared.apply_settings(slow.clone()).await.unwrap();
+        receiver.recv().await.unwrap();
+        assert!(
+            !shared.preset_modified(),
+            "Response changes must not modify the colour profile"
+        );
+        slow.saturation_boost = 1.8;
+        shared.apply_settings(slow.clone()).await.unwrap();
+        receiver.recv().await.unwrap();
+        let (_, saved) = shared.preset_save_snapshot(&slow);
+        shared.mark_presets_saved(saved);
+        for (name, reset) in [
+            ("darkSceneDetail", false),
+            ("neonContrast", false),
+            ("neonContrast", true),
+            ("softColor", false),
+            ("vividColor", false),
+            ("neutral", false),
+        ] {
+            shared.select_preset(name.into(), reset).await.unwrap();
+            receiver.recv().await.unwrap();
+            let current = shared.current_settings.read().unwrap();
+            assert_eq!(
+                (
+                    current.smoothing_factor,
+                    current.rise_smoothing_factor,
+                    current.fall_smoothing_factor,
+                    current.max_color_step
+                ),
+                (0.2, 0.18, 0.22, 6)
+            );
+            assert_eq!(current.spatial_blend, 0.3);
+            if name == "neonContrast" && !reset {
+                assert_eq!(current.saturation_boost, 1.8);
+            }
+        }
     }
 
     #[tokio::test]
@@ -2501,6 +2886,22 @@ mod tests {
 
     #[test]
     fn spatial_blend_defaults_and_validation_are_backward_compatible() {
+        let mut json = serde_json::to_value(settings()).unwrap();
+        json.as_object_mut().unwrap().remove("depth_influence");
+        let legacy: LiveSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.depth_influence, 0.5);
+        for value in [0.0, 0.5, 1.0] {
+            let mut input = settings();
+            input.depth_influence = value;
+            assert!(input.validate().is_ok());
+            Preset::named("vividColor").unwrap().apply(&mut input);
+            assert_eq!(input.depth_influence, value);
+        }
+        for value in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+            let mut input = settings();
+            input.depth_influence = value;
+            assert!(input.validate().is_err());
+        }
         let mut json = serde_json::to_value(settings()).unwrap();
         json.as_object_mut().unwrap().remove("spatial_blend");
         let old: LiveSettings = serde_json::from_value(json).unwrap();

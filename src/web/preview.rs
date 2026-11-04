@@ -168,8 +168,8 @@ pub fn render(frame: &PreviewFrame, settings: &LiveSettings) -> Result<PreviewFr
     for (value, low, high) in [
         (settings.brightness_multiplier, 0.5, 2.5),
         (settings.hue_output_brightness, 0.25, 2.0),
-        (settings.saturation_boost, 1.0, 2.5),
-        (settings.gamma, 0.8, 2.0),
+        (settings.saturation_boost, 0.5, 2.5),
+        (settings.gamma, 0.5, 2.0),
         (settings.noise_gate_threshold, 0.0, 0.06),
     ] {
         if !value.is_finite() || !(low..=high).contains(&value) {
@@ -302,6 +302,9 @@ mod tests {
             vec![255, 128, 0, 130, 65, 0]
         );
         settings.hue_output_brightness = 1.0;
+        settings.gamma = 0.5;
+        settings.saturation_boost = 0.5;
+        assert!(render(&frame, &settings).is_ok());
         settings.gamma = f32::NAN;
         assert!(render(&frame, &settings).is_err());
         settings.gamma = 1.0;
