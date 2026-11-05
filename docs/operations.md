@@ -422,6 +422,14 @@ no fallback and no HTTP. A new emulator certificate needs an explicit re-pair. A
 `hue_bridge_kind` is a real bridge and keeps the CA and Bridge ID checks unchanged. DTLS is
 unchanged: it uses the PSK from pairing in both modes.
 
+Emulated pairing accepts only a private (10.x, 172.16-31.x, 192.168.x) or link-local
+(169.254.x) IPv4 address: the stream goes where the pin was taken, with no CA behind it. The
+CLI, the dashboard and `scripts/pair_hue.py` share this check in `pair_bridge`; real-bridge
+pairing keeps its address rules. If the certificate at that address chains to the Philips Hue
+roots, pairing still succeeds but logs a warning: it is a real bridge, so pair it without
+`--emulated-bridge`. An emulated pin breaks when Philips renews the certificate, and
+real-bridge mode accepts that renewal.
+
 If several bridges are discovered, supply the intended IP explicitly. If pairing succeeds but
 area discovery fails or several areas exist, credentials are still saved; choose an area in the
 dashboard or run `lg-hue-sync sync-hue --config <path> --area <name-or-id>`. Hue output stays

@@ -41,6 +41,10 @@ checks discard old subscriptions. Authoritative deletion or rejected authorizati
 transient event transport errors retry with bounded backoff. Layout changes stop cached output
 before refresh; a failed refresh remains blocked until a successful refresh or area selection.
 Ownership loss suspends Hue without stopping Nanoleaf. Manual Start can retry ownership loss.
+Dropping the DTLS client sends one close_notify alert (best effort, write bounded to 100 ms,
+errors at debug level), so the bridge frees the session at once instead of after about 10 s of
+silence. Every stop path drops the client before its HTTPS stop request: the alert reaches a
+session the bridge still holds, and the stop request stays the authoritative release.
 Explicit area-refresh requests still run synchronously in the daemon loop.
 
 Hue's application key authorizes HTTPS; the separate application ID from `/auth/v1` identifies
@@ -96,7 +100,7 @@ Hue v2 may group several physical gradient segments into one Entertainment chann
 - Pairing requires physical access to the Bridge or controller.
 - `config.json` contains secrets and must be mode `0600` on the TV.
 - Hue HTTPS trusts only the two official Hue root CAs and checks the certificate CN against the saved Bridge ID before sending credentials. An existing leaf pin must match exactly to bootstrap a missing Bridge ID. Signed renewal is accepted only for that saved identity; changed identities require explicit pairing. No plaintext fallback is permitted.
-- Exception, opt-in only: a bridge paired explicitly as emulated (`hue_bridge_kind: "emulated"`, for example Bifrost) has no Hue CA. Its leaf certificate SHA-256 is pinned on first use at pairing and every later connection must match it exactly, plus the saved Bridge ID. No CA path, no fallback; rediscovery reaches only an address that presents the same pinned certificate. Configs without the field are real bridges.
+- Exception, opt-in only: a bridge paired explicitly as emulated (`hue_bridge_kind: "emulated"`, for example Bifrost) has no Hue CA. Its leaf certificate SHA-256 is pinned on first use at pairing and every later connection must match it exactly, plus the saved Bridge ID. No CA path, no fallback; rediscovery reaches only an address that presents the same pinned certificate. Configs without the field are real bridges. Emulated pairing accepts only a private or link-local IPv4 address, and warns when the certificate chains to the Hue roots (a real bridge belongs in real-bridge mode). Any `hue_bridge_kind` value other than `"emulated"` or `"real"` (for example `"Emulated"` or `null`) makes the config fail to load.
 - Never log credentials, tokens, certificate pins, or complete configuration payloads.
 
 ## Native API references
