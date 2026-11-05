@@ -105,12 +105,32 @@ impl LightZone {
         self.hue_device_id.is_some() && self.hue_segment_count == Some(1)
     }
 
+    /// Gradient-strip segments sit behind the TV: they read the picture edge, like Ambilight.
+    pub(crate) fn uses_edge_sampling(&self) -> bool {
+        self.hue_channel_position.is_some()
+            && self.hue_device_id.is_some()
+            && self.hue_segment_count > Some(1)
+    }
+
+    /// Point on the left, top or right picture edge that an edge-sampled segment reads.
+    pub(crate) fn edge_point(&self) -> Option<(f32, f32)> {
+        let pos = self
+            .hue_channel_position
+            .filter(|_| self.uses_edge_sampling())?;
+        let (u, v) = screen_point(pos);
+        Some(project_to_edge(u, v))
+    }
+
     pub fn set_depth_influence(&mut self, influence: f32) {
         let Some(pos) = self.hue_channel_position else {
             return; // Legacy/manual rectangles have no recoverable room-depth coordinate.
         };
-        let x = pos[0].clamp(-1.0, 1.0) * 0.5 + 0.5;
-        let y = 0.5 - pos[2].clamp(-1.0, 1.0) * 0.5;
+        if let Some(point) = self.edge_point() {
+            // The edge band has a fixed size: room depth does not move a strip behind the TV.
+            [self.x_min, self.x_max, self.y_min, self.y_max] = edge_band(point);
+            return;
+        }
+        let (x, y) = screen_point(pos);
         let depth = ((1.0 - pos[1]) * 0.5).clamp(0.0, 1.0);
         let curve = depth * depth * (3.0 - 2.0 * depth);
         let span = 0.25
@@ -125,6 +145,87 @@ impl LightZone {
 
 pub fn default_depth_influence() -> f32 {
     0.5
+}
+
+/// Gaussian sigma along the picture edge, as a fraction of the active side. About a tenth
+/// of the side keeps neighbouring segments distinct, yet their bands still overlap.
+pub(crate) const EDGE_SIGMA_ALONG: f32 = 0.08;
+/// Inward decay length, as a fraction of the active side: weight exp(-d / depth). The light
+/// follows the outermost content, and a centred subject past 3 depths (18 %) weighs nothing.
+pub(crate) const EDGE_DEPTH: f32 = 0.06;
+/// Distance under which an edge point counts as lying on an edge.
+const EDGE_EPSILON: f32 = 1e-4;
+
+/// Hue room coordinates to normalised screen coordinates: X to u, Z (height) to v.
+fn screen_point(pos: [f32; 3]) -> (f32, f32) {
+    (
+        pos[0].clamp(-1.0, 1.0) * 0.5 + 0.5,
+        0.5 - pos[2].clamp(-1.0, 1.0) * 0.5,
+    )
+}
+
+/// Radial projection from the picture centre onto the left, top or right edge.
+/// A ray towards the bottom edge goes to the nearer bottom corner: the strip has no bottom side.
+pub(crate) fn project_to_edge(u: f32, v: f32) -> (f32, f32) {
+    let (dx, dy) = (u - 0.5, v - 0.5);
+    if dx.abs() < EDGE_EPSILON && dy.abs() < EDGE_EPSILON {
+        return (0.5, 0.0);
+    }
+    if dy >= dx.abs() {
+        return (if dx < 0.0 { 0.0 } else { 1.0 }, 1.0);
+    }
+    if dx.abs() >= dy.abs() {
+        let x = if dx < 0.0 { 0.0 } else { 1.0 };
+        (x, (0.5 + 0.5 * dy / dx.abs()).clamp(0.0, 1.0))
+    } else {
+        ((0.5 + 0.5 * dx / dy.abs()).clamp(0.0, 1.0), 0.0)
+    }
+}
+
+/// Edges an edge point lies on: the x of its left or right edge, and whether it is on the top.
+pub(crate) fn edge_sides(point: (f32, f32)) -> (Option<f32>, bool) {
+    let side = if point.0 <= EDGE_EPSILON {
+        Some(0.0)
+    } else if point.0 >= 1.0 - EDGE_EPSILON {
+        Some(1.0)
+    } else {
+        None
+    };
+    (side, point.1 <= EDGE_EPSILON)
+}
+
+/// Bounding rectangle [x_min, x_max, y_min, y_max] of an edge band: 3 sigma along the edge
+/// on each side of the point, 3 depths inward. A corner point takes the union of both bands.
+pub(crate) fn edge_band(point: (f32, f32)) -> [f32; 4] {
+    let along = 3.0 * EDGE_SIGMA_ALONG;
+    let deep = 3.0 * EDGE_DEPTH;
+    let (side, top) = edge_sides(point);
+    let mut band = [
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    let mut include = |x_min: f32, x_max: f32, y_min: f32, y_max: f32| {
+        band = [
+            band[0].min(x_min),
+            band[1].max(x_max),
+            band[2].min(y_min),
+            band[3].max(y_max),
+        ];
+    };
+    if let Some(edge_x) = side {
+        let (x_min, x_max) = if edge_x == 0.0 {
+            (0.0, deep)
+        } else {
+            (1.0 - deep, 1.0)
+        };
+        include(x_min, x_max, point.1 - along, point.1 + along);
+    }
+    if top {
+        include(point.0 - along, point.0 + along, 0.0, deep);
+    }
+    band.map(|bound| bound.clamp(0.0, 1.0))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1171,15 +1272,21 @@ mod tests {
     #[test]
     fn depth_expansion_is_bounded_symmetric_and_preserves_channel_metadata() {
         let mut zone = LightZone::from_3d_position(7, "Gradient", [0.0, -1.0, 0.0]);
-        zone.hue_device_id = Some("device".into());
         zone.hue_segment_index = Some(3);
         zone.hue_segment_count = Some(7);
+        // Without a V2 owner device the segment keeps the depth-scaled square.
         for (influence, expected) in [(0.0, 0.25), (0.5, 0.3125), (1.0, 0.375)] {
             zone.set_depth_influence(influence);
             assert!((zone.x_max - zone.x_min - expected).abs() < 1e-6);
             assert!((zone.y_max - zone.y_min - expected).abs() < 1e-6);
             assert!((zone.x_min + zone.x_max - 1.0).abs() < 1e-6);
         }
+        // An edge band does not grow with depth influence.
+        zone.hue_device_id = Some("device".into());
+        zone.set_depth_influence(0.0);
+        let band = [zone.x_min, zone.x_max, zone.y_min, zone.y_max];
+        zone.set_depth_influence(1.0);
+        assert_eq!(band, [zone.x_min, zone.x_max, zone.y_min, zone.y_max]);
         assert_eq!(
             (
                 zone.channel_id,
@@ -1220,6 +1327,60 @@ mod tests {
             restored_zone.hue_channel_position,
             zone.hue_channel_position
         );
+    }
+
+    #[test]
+    fn gradient_segments_project_onto_left_top_and_right_edges_in_hue_order() {
+        // A ring around the picture centre, in Hue order from the lower left over the top.
+        let ring: [[f32; 3]; 6] = [
+            [-0.8, 0.0, -0.3],
+            [-0.8, 0.0, 0.3],
+            [-0.3, 0.0, 0.8],
+            [0.3, 0.0, 0.8],
+            [0.8, 0.0, 0.3],
+            [0.8, 0.0, -0.3],
+        ];
+        let zones: Vec<LightZone> = ring
+            .iter()
+            .enumerate()
+            .map(|(index, &pos)| {
+                let mut zone = LightZone::from_3d_position(index as u8, "Strip", pos);
+                zone.hue_device_id = Some("strip".into());
+                zone.hue_segment_index = Some(index as u8);
+                zone.hue_segment_count = Some(ring.len() as u8);
+                zone.set_depth_influence(0.5);
+                zone
+            })
+            .collect();
+        let points: Vec<(f32, f32)> = zones.iter().map(|z| z.edge_point().unwrap()).collect();
+        assert_eq!(
+            zones.iter().map(|z| z.channel_id).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+        // Left edge going up, top edge going right, right edge going down.
+        assert!(points[0].0 == 0.0 && points[1].0 == 0.0 && points[0].1 > points[1].1);
+        assert!(points[2].1 == 0.0 && points[3].1 == 0.0 && points[2].0 < points[3].0);
+        assert!(points[4].0 == 1.0 && points[5].0 == 1.0 && points[4].1 < points[5].1);
+        // Left and right bands hug their edge, 3 depths deep; the top band hugs the top.
+        assert!(zones[0].x_min == 0.0 && (zones[0].x_max - 0.18).abs() < 1e-6);
+        assert!(zones[2].y_min == 0.0 && (zones[2].y_max - 0.18).abs() < 1e-6);
+        assert!(zones[5].x_max == 1.0 && (zones[5].x_min - 0.82).abs() < 1e-6);
+
+        // The strip has no bottom side: a bottom ray goes to the nearer bottom corner.
+        assert_eq!(project_to_edge(0.6, 0.95), (1.0, 1.0));
+        assert_eq!(project_to_edge(0.4, 0.95), (0.0, 1.0));
+        assert_eq!(project_to_edge(0.5, 0.5), (0.5, 0.0));
+        let mut bottom = LightZone::from_3d_position(9, "Strip", [-0.2, 0.0, -0.9]);
+        bottom.hue_device_id = Some("strip".into());
+        bottom.hue_segment_count = Some(7);
+        bottom.set_depth_influence(0.5);
+        assert_eq!(bottom.edge_point(), Some((0.0, 1.0)));
+        assert_eq!(bottom.y_max, 1.0);
+        // A top corner takes the union of its top and side bands.
+        let corner = edge_band((0.0, 0.0));
+        for (actual, expected) in corner.into_iter().zip([0.0, 0.24, 0.0, 0.24]) {
+            assert!((actual - expected).abs() < 1e-6, "{corner:?}");
+        }
     }
 
     #[test]
