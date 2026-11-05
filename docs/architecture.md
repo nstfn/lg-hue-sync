@@ -96,6 +96,7 @@ Hue v2 may group several physical gradient segments into one Entertainment chann
 - Pairing requires physical access to the Bridge or controller.
 - `config.json` contains secrets and must be mode `0600` on the TV.
 - Hue HTTPS trusts only the two official Hue root CAs and checks the certificate CN against the saved Bridge ID before sending credentials. An existing leaf pin must match exactly to bootstrap a missing Bridge ID. Signed renewal is accepted only for that saved identity; changed identities require explicit pairing. No plaintext fallback is permitted.
+- Exception, opt-in only: a bridge paired explicitly as emulated (`hue_bridge_kind: "emulated"`, for example Bifrost) has no Hue CA. Its leaf certificate SHA-256 is pinned on first use at pairing and every later connection must match it exactly, plus the saved Bridge ID. No CA path, no fallback; rediscovery reaches only an address that presents the same pinned certificate. Configs without the field are real bridges.
 - Never log credentials, tokens, certificate pins, or complete configuration payloads.
 
 ## Native API references

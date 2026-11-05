@@ -28,7 +28,7 @@ Rust daemon and LAN dashboard for screen-derived Philips Hue Entertainment and N
 - Upload, install, restart, autoroot, Luna mutation, or live light output requires explicit user direction.
 - Verify deployment with local/remote SHA-256, service state, dashboard status, and—when claimed—physical output.
 - Hue v2 channel IDs and grouped gradient members are authoritative; never invent absent channels.
-- Hue HTTPS must verify both official Hue root CAs and the saved Bridge ID. Legacy pins bootstrap identity only on an exact match; never fall back to HTTP or another bridge after identity/authentication failure.
+- Hue HTTPS must verify both official Hue root CAs and the saved Bridge ID. Legacy pins bootstrap identity only on an exact match; never fall back to HTTP or another bridge after identity/authentication failure. Only an explicit emulated-bridge pairing (`hue_bridge_kind: "emulated"`) replaces the CA check, with an exact leaf-certificate pin taken at pairing; never select that mode implicitly.
 - DTLS uses the application ID from `/auth/v1`, not the application key. Never take over or stop another app's stream. Known invalid sessions/layouts must stop cached Hue output without stopping Nanoleaf.
 - Hue and Nanoleaf remain independently controllable. Hue physical placement belongs to the Hue app.
 - Known non-HDMI foreground apps/Home must release capture and report `unsupported_source`; resume automatically on HDMI only when source-paused, never after manual Stop. Unknown observations preserve the last known policy; do not classify numeric native errors as DRM.

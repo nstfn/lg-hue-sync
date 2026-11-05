@@ -93,7 +93,7 @@ Start from [config.example.json](config.example.json), or pair through the dashb
 /var/home/root/lg-hue-sync/config.json
 ```
 
-Hue HTTPS validates the two official Hue root CAs and the saved Bridge ID. Existing certificate pins bootstrap that identity only on an exact match; subsequent signed certificate renewal retains the identity check. Pairing never falls back to HTTP. Status endpoints never return Hue or Nanoleaf secrets.
+Hue HTTPS validates the two official Hue root CAs and the saved Bridge ID. A bridge emulator such as Bifrost pairs only through the explicit `pair --bridge <bridge-ip> --emulated-bridge` option (or the dashboard's **Emulated bridge** box), which pins its self-signed certificate on first use; see [operations](docs/operations.md#emulated-bridge-opt-in). Existing certificate pins bootstrap that identity only on an exact match; subsequent signed certificate renewal retains the identity check. Pairing never falls back to HTTP. Status endpoints never return Hue or Nanoleaf secrets.
 
 ## Project layout
 

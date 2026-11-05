@@ -409,6 +409,19 @@ legacy pin match establishes the saved Bridge ID; later CA-signed certificate re
 validated against that ID. A changed certificate before identity migration requires explicit
 re-pairing. Do not remove the pin to bypass a validation failure.
 
+### Emulated bridge (opt-in)
+
+A Hue bridge emulator such as Bifrost cannot present a Philips-signed certificate. Pair it only
+by explicit choice, at its explicit address: `lg-hue-sync pair --bridge <bridge-ip>
+--emulated-bridge`, or tick **Emulated bridge** in the dashboard. Pairing reads the emulator's
+self-signed certificate, pins its leaf SHA-256 (trust on first use) and saves
+`"hue_bridge_kind": "emulated"`. The CLI prints the pin and the dashboard shows it; compare it
+with the emulator's certificate before you rely on it. From then on every HTTPS request, on the
+saved address or after rediscovery, must present exactly that certificate: there is no CA path,
+no fallback and no HTTP. A new emulator certificate needs an explicit re-pair. A config without
+`hue_bridge_kind` is a real bridge and keeps the CA and Bridge ID checks unchanged. DTLS is
+unchanged: it uses the PSK from pairing in both modes.
+
 If several bridges are discovered, supply the intended IP explicitly. If pairing succeeds but
 area discovery fails or several areas exist, credentials are still saved; choose an area in the
 dashboard or run `lg-hue-sync sync-hue --config <path> --area <name-or-id>`. Hue output stays
