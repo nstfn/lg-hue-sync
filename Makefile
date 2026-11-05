@@ -13,6 +13,9 @@ SSH_PORT       ?= 22
 TARGET         := armv7-unknown-linux-gnueabi
 BINARY         := target/$(TARGET)/release/lg-hue-sync
 REMOTE_DIR     := /var/home/root/lg-hue-sync
+# The config path the installed unit passes with --config. The webOS 11 hardened layout
+# (deploy/webos11) keeps it in state/. The TV's shell expands this inside a quoted ssh command.
+REMOTE_CONFIG  = \$$(systemctl cat lg-hue-sync 2>/dev/null | sed -n 's|^ExecStart=.*--config \([^ ]*\).*|\1|p' | tail -n 1 | grep . || echo $(REMOTE_DIR)/config.json)
 RUST_VERSION   ?= stable
 CROSS_IMAGE    ?= lg-hue-sync-cross:rust-$(RUST_VERSION)
 CARGO_CACHE    ?= lg-hue-sync-cargo
@@ -206,7 +209,7 @@ deploy-config: require-tv
 	@printf "$(CYAN)[*] Deploying config.json to root@$(TV_IP)...$(RESET)\n"
 	ssh $(SSH_OPTS) root@$(TV_IP) "mkdir -p $(REMOTE_DIR)"
 	@# Mode 600 from creation: config.json holds the Hue and Nanoleaf credentials.
-	ssh $(SSH_OPTS) root@$(TV_IP) "umask 077 && cat > $(REMOTE_DIR)/config.json.new && chmod 600 $(REMOTE_DIR)/config.json.new && mv -f $(REMOTE_DIR)/config.json.new $(REMOTE_DIR)/config.json && systemctl restart lg-hue-sync" < config.json
+	ssh $(SSH_OPTS) root@$(TV_IP) "umask 077 && C=$(REMOTE_CONFIG) && cat > \"\$$C.new\" && chmod 600 \"\$$C.new\" && mv -f \"\$$C.new\" \"\$$C\" && systemctl restart lg-hue-sync" < config.json
 	@printf "$(GREEN)[+] Config deployed and service restarted.$(RESET)\n"
 
 ## package and deploy webOS application to Home Dashboard ribbon
@@ -219,7 +222,7 @@ deploy-app: require-tv
 ## run vtcapture screen capture probe on TV over SSH
 test-capture: require-tv
 	@printf "$(CYAN)[*] Running test-capture on TV (160x90 vtcapture HDMI probe)...$(RESET)\n"
-	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync test-capture --config $(REMOTE_DIR)/config.json"
+	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync test-capture --config \"$(REMOTE_CONFIG)\""
 
 ## check daemon systemd service status on TV
 status: require-tv
@@ -254,7 +257,7 @@ root: require-tv
 
 ## pair Hue Bridge and discover entertainment zones
 pair: require-tv
-	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync pair --output $(REMOTE_DIR)/config.json && systemctl restart lg-hue-sync"
+	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync pair --output \"$(REMOTE_CONFIG)\" && systemctl restart lg-hue-sync"
 
 ## clean cargo target directory
 clean:
