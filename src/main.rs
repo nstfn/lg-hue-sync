@@ -844,6 +844,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         observer::POLL_PERIOD,
         auto_tv_power,
         config.fps == 0 && pipeline_state == PipelineState::Running,
+        {
+            let shared = shared_state.clone();
+            Box::new(move |started, display| shared.observe_display(started, display))
+        },
     );
     // Start of the last direct source query: an older background round must not undo it.
     let mut last_direct_source: Option<tokio::time::Instant> = None;

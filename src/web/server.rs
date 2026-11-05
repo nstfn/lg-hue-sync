@@ -365,6 +365,9 @@ impl SyncStatus {
 pub struct SharedState {
     display_control: Mutex<()>,
     pub display_off: AtomicBool,
+    /// When a dashboard read or write last set `display_off`; an older background round
+    /// must not undo it. A std mutex: the frame loop takes it without waiting on Luna.
+    display_direct: std::sync::Mutex<Option<tokio::time::Instant>>,
     active_preset: RwLock<Option<String>>,
     saved_presets: RwLock<BTreeMap<String, PresetTuning>>,
     pub preview: PreviewState,
@@ -409,6 +412,7 @@ impl SharedState {
         Self {
             display_control: Mutex::new(()),
             display_off: AtomicBool::new(false),
+            display_direct: std::sync::Mutex::new(None),
             active_preset: RwLock::new(None),
             saved_presets: RwLock::new(BTreeMap::new()),
             preview: PreviewState::default(),
@@ -531,6 +535,24 @@ impl SharedState {
 
     pub fn light_update_fps(&self) -> f32 {
         self.light_updates_x100.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    /// Applies a background panel reading unless a dashboard reading or write is newer than the
+    /// round's start.
+    pub fn observe_display(&self, round_started: tokio::time::Instant, enabled: Option<bool>) {
+        let Some(enabled) = enabled else {
+            return;
+        };
+        let direct = self.display_direct.lock().unwrap();
+        if direct.is_none_or(|direct| round_started >= direct) {
+            self.display_off.store(!enabled, Ordering::Relaxed);
+        }
+    }
+
+    fn set_display_direct(&self, enabled: bool) {
+        let mut direct = self.display_direct.lock().unwrap();
+        self.display_off.store(!enabled, Ordering::Relaxed);
+        *direct = Some(tokio::time::Instant::now());
     }
 
     pub fn set_tv_power_state(&self, active: Option<bool>) {
@@ -729,12 +751,7 @@ pub async fn start_web_server(
                 }
             };
             *shared.diagnostics.write().unwrap() = snapshot;
-            {
-                let _guard = shared.display_control.lock().await;
-                if let Ok(Some(enabled)) = crate::tv_power::display_enabled().await {
-                    shared.display_off.store(!enabled, Ordering::Relaxed);
-                }
-            }
+            // The panel state comes from the Luna observer's power query (`observe_display`).
             tokio::select! {
                 _ = diagnostics_shutdown.cancelled() => break,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
@@ -1157,7 +1174,7 @@ async fn display_status(State(state): State<AppState>) -> Result<Json<DisplaySta
         .await
         .map_err(|error| ApiError::SetupFailed(error.to_string()))?;
     if let Some(enabled) = enabled {
-        state.shared.display_off.store(!enabled, Ordering::Relaxed);
+        state.shared.set_display_direct(enabled);
     }
     Ok(Json(DisplayState { enabled }))
 }
@@ -1198,7 +1215,7 @@ async fn display_control(
             .map_err(|error| ApiError::SetupFailed(error.to_string()))?
     };
     if let Some(enabled) = actual {
-        state.shared.display_off.store(!enabled, Ordering::Relaxed);
+        state.shared.set_display_direct(enabled);
     }
     Ok(Json(DisplayState { enabled: actual }))
 }
@@ -2165,6 +2182,34 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), tasks.wait())
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn background_panel_rounds_never_undo_a_newer_dashboard_display_change() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let shared = SharedState::new(
+            settings(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            sender,
+        );
+        let off = |shared: &SharedState| shared.display_off.load(Ordering::Relaxed);
+        let before = tokio::time::Instant::now();
+        shared.observe_display(before, Some(false));
+        assert!(off(&shared));
+        shared.observe_display(before, None);
+        assert!(off(&shared), "an unknown panel state keeps the last one");
+
+        shared.set_display_direct(true);
+        shared.observe_display(before, Some(false));
+        assert!(
+            !off(&shared),
+            "a round older than the dashboard change is dropped"
+        );
+        shared.observe_display(tokio::time::Instant::now(), Some(false));
+        assert!(off(&shared));
     }
 
     #[tokio::test]

@@ -39,18 +39,38 @@ pub async fn set_display(enabled: bool) -> Result<Option<bool>> {
     }
 }
 
-pub async fn is_active() -> Result<Option<bool>> {
+/// Both readings of one `getPowerState` reply, so one poller serves power following and the
+/// panel state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PowerState {
+    /// `Some(true)` active, `Some(false)` standby or screen off, `None` an unknown state.
+    pub active: Option<bool>,
+    /// Panel state; `None` in standby or for an unknown state (see `display_enabled`).
+    pub display: Option<bool>,
+}
+
+pub async fn power_state() -> Result<PowerState> {
     let response = crate::luna::query(POWER_STATE_URI, "{}")
         .await
         .context("webOS TV power query failed")?;
+    parse_power_state(&response)
+}
+
+pub async fn is_active() -> Result<Option<bool>> {
+    Ok(power_state().await?.active)
+}
+
+fn parse_power_state(response: &Value) -> Result<PowerState> {
     if response.get("returnValue") == Some(&Value::Bool(false)) {
         return Err(anyhow!("webOS TV power query failed"));
     }
-
-    Ok(response
-        .get("state")
-        .and_then(Value::as_str)
-        .and_then(parse_state))
+    Ok(PowerState {
+        active: response
+            .get("state")
+            .and_then(Value::as_str)
+            .and_then(parse_state),
+        display: parse_display_state(response),
+    })
 }
 
 fn parse_state(state: &str) -> Option<bool> {
@@ -94,5 +114,33 @@ mod tests {
             assert_eq!(parse_state(state), Some(false));
         }
         assert_eq!(parse_state("unrecognized"), None);
+    }
+
+    #[test]
+    fn one_reply_gives_power_and_panel_state() {
+        let parse = |reply| parse_power_state(&reply).unwrap();
+        assert_eq!(
+            parse(serde_json::json!({"returnValue": true, "state": "Active"})),
+            PowerState {
+                active: Some(true),
+                display: Some(true)
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"state": "Screen Off"})),
+            PowerState {
+                active: Some(false),
+                display: Some(false)
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"state": "Active Standby"})),
+            PowerState {
+                active: Some(false),
+                display: None
+            }
+        );
+        assert_eq!(parse(serde_json::json!({})), PowerState::default());
+        assert!(parse_power_state(&serde_json::json!({"returnValue": false})).is_err());
     }
 }
