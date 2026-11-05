@@ -235,6 +235,10 @@ pub struct Config {
     /// SHA-256 fingerprint of the bridge's local V2 HTTPS certificate.
     #[serde(default)]
     pub hue_bridge_certificate_sha256: Option<String>,
+    /// `emulated` only after an explicit emulated-bridge pairing: the certificate pin above is
+    /// then the only trust. Absent means a real Hue bridge, so existing configs stay unchanged.
+    #[serde(default, skip_serializing_if = "crate::hue::BridgeKind::is_real")]
+    pub hue_bridge_kind: crate::hue::BridgeKind,
     /// Deprecated V1 selector retained only to load existing configurations.
     /// New configurations store the V2 UUID here as well as in `entertainment_configuration_id`.
     pub entertainment_area_id: String,
@@ -407,6 +411,7 @@ impl Config {
         self.clientkey = paired.clientkey;
         self.hue_bridge_id = Some(paired.bridge_id);
         self.hue_bridge_certificate_sha256 = Some(paired.certificate_sha256);
+        self.hue_bridge_kind = paired.kind;
         self.hue_enabled = true;
         self.hue_sync_enabled = true;
         self.entertainment_configuration_id = paired
@@ -435,6 +440,7 @@ impl Config {
         crate::hue::BridgeTrust {
             bridge_id: self.hue_bridge_id.as_deref(),
             certificate_sha256: self.hue_bridge_certificate_sha256.as_deref(),
+            kind: self.hue_bridge_kind,
         }
     }
 
@@ -468,6 +474,7 @@ impl Config {
             clientkey: clientkey.to_string(),
             hue_bridge_id: None,
             hue_bridge_certificate_sha256: None,
+            hue_bridge_kind: crate::hue::BridgeKind::Real,
             entertainment_area_id: area_id.to_string(),
             entertainment_configuration_id: None,
             nanoleaf: None,
@@ -881,6 +888,7 @@ mod tests {
             area: None,
             bridge_id: "001788fffe000001".into(),
             certificate_sha256: "aa".repeat(32),
+            kind: crate::hue::BridgeKind::Real,
         };
         config.apply_hue_pairing("192.0.2.1".into(), paired);
         assert_eq!(config.username, "test-application-key");
@@ -889,6 +897,49 @@ mod tests {
         assert!(config.hue_enabled && config.hue_sync_enabled);
         assert!(config.entertainment_configuration_id.is_none());
         assert!(config.entertainment_area_id.is_empty() && config.zones.is_empty());
+    }
+
+    #[test]
+    fn bridge_kind_is_real_unless_an_emulated_pairing_saved_it() {
+        use crate::hue::BridgeKind;
+        // An existing config has no kind field: it stays a real bridge and writes no new key.
+        let mut value = serde_json::to_value(Config::new_default("", "", "", "")).unwrap();
+        assert!(value.get("hue_bridge_kind").is_none());
+        value["hue_bridge_id"] = "001788fffe000001".into();
+        value["hue_bridge_certificate_sha256"] = "aa".repeat(32).into();
+        let config: Config = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.hue_bridge_kind, BridgeKind::Real);
+        assert_eq!(config.hue_trust().kind, BridgeKind::Real);
+        assert!(serde_json::to_value(&config)
+            .unwrap()
+            .get("hue_bridge_kind")
+            .is_none());
+
+        value["hue_bridge_kind"] = "emulated".into();
+        let config: Config = serde_json::from_value(value.clone()).unwrap();
+        let trust = config.hue_trust();
+        assert_eq!(trust.kind, BridgeKind::Emulated);
+        assert_eq!(trust.certificate_sha256, Some("aa".repeat(32).as_str()));
+        assert_eq!(serde_json::to_value(&config).unwrap()["hue_bridge_kind"], "emulated");
+        value["hue_bridge_kind"] = "bifrost".into();
+        assert!(serde_json::from_value::<Config>(value).is_err());
+
+        // Re-pairing replaces the kind: emulated to real and back.
+        let mut config = config;
+        let paired = |kind| crate::hue::PairedBridge {
+            username: "test-application-key".into(),
+            clientkey: "00".repeat(16),
+            area: None,
+            bridge_id: "001788fffe000001".into(),
+            certificate_sha256: "bb".repeat(32),
+            kind,
+        };
+        config.apply_hue_pairing("192.0.2.1".into(), paired(BridgeKind::Real));
+        assert_eq!(config.hue_bridge_kind, BridgeKind::Real);
+        config.apply_hue_pairing("192.0.2.1".into(), paired(BridgeKind::Emulated));
+        assert_eq!(config.hue_bridge_kind, BridgeKind::Emulated);
+        let pin = "bb".repeat(32);
+        assert_eq!(config.hue_bridge_certificate_sha256.as_deref(), Some(pin.as_str()));
     }
 
     #[test]

@@ -565,9 +565,10 @@
     <h2 class="device-heading">Philips Hue</h2>
     <div class="toggle-desc">Pair once, then select the Entertainment Area this TV should control.</div>
     <input class="text-input" id="hueBridgeIp" inputmode="decimal" placeholder="Hue Bridge IP — blank to discover">
+    <label class="toggle-desc" style="display:block;margin-bottom:8px"><input type="checkbox" id="hueEmulatedBridge"> Emulated bridge (for example Bifrost): enter its IP, trust its self-signed certificate on first use, then accept only that certificate</label>
     <button class="secondary-btn" style="width:100%" onclick="pairHue()">Pair Hue Bridge</button>
     <div class="toggle-desc" style="margin-top:8px">Press the round Bridge button, then tap Pair within 45 seconds.</div>
-    <div class="toggle-desc" id="hueSetupStatus" style="margin-top:12px"></div>
+    <div class="toggle-desc" id="hueSetupStatus" style="margin-top:12px;overflow-wrap:anywhere"></div>
     <div class="device-status"><strong>Bridge status</strong><div id="statHue">Connecting…</div></div>
     <div class="control-header" style="margin-top:18px"><label for="hueAreaSelect">Entertainment Area</label></div>
     <div class="area-select-row"><select class="text-input" id="hueAreaSelect" aria-label="Hue Entertainment Area" disabled onchange="selectHueArea()"><option>Loading areas…</option></select><button class="secondary-btn icon-btn" type="button" onclick="loadHueAreas()" aria-label="Refresh Entertainment Areas" title="Refresh Entertainment Areas">↻</button></div>
@@ -1595,14 +1596,19 @@
       const status = document.getElementById(kind === 'hue' ? 'hueSetupStatus' : 'nanoleafSetupStatus');
       status.innerText = 'Waiting for physical pairing confirmation…';
       try {
+        const request = { ip: document.getElementById(inputId).value.trim() || null };
+        if (kind === 'hue' && document.getElementById('hueEmulatedBridge').checked) request.emulated_bridge = true;
         const res = await fetch('/api/pair/' + kind, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ip: document.getElementById(inputId).value.trim() || null })
+          body: JSON.stringify(request)
         });
         const body = await res.json();
         if (!res.ok) throw new Error(body.error || 'Pairing failed');
         status.innerText = 'Saved securely. The service will restart and connect automatically.';
+        if (body.certificate_sha256) {
+          status.innerText += '\nEmulated bridge ' + body.bridge_id + ' pinned. Certificate SHA-256: ' + body.certificate_sha256 + '. Check it against the emulator.';
+        }
         if (kind === 'hue') setTimeout(loadHueAreas, 5000);
       } catch (error) {
         status.innerText = error.message;

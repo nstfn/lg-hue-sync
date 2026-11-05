@@ -5,7 +5,7 @@
 # ///
 """Deprecated compatibility wrapper for the Rust HTTPS pairing command.
 
-Usage: uv run scripts/pair_hue.py [--bridge-ip <bridge-ip>] [--output-config config.json]
+Usage: uv run scripts/pair_hue.py [--bridge-ip <bridge-ip> [--emulated-bridge]] [--output-config config.json]
 Use `cargo run --locked -- pair` directly for new workflows.
 """
 
@@ -18,10 +18,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bridge-ip", help="Manual Hue Bridge IP address")
     parser.add_argument("--output-config", default="config.json", help="Credential configuration path")
+    parser.add_argument("--emulated-bridge", action="store_true", help="Pin the self-signed certificate of a bridge emulator (needs --bridge-ip)")
     parser.add_argument("--tv-ip", help="Removed: direct Hyperion configuration is unsupported")
     args = parser.parse_args()
     if args.tv_ip:
         parser.error("--tv-ip is no longer supported; this wrapper pairs LG Hue Sync only")
+    if args.emulated_bridge and not args.bridge_ip:
+        parser.error("--emulated-bridge needs an explicit --bridge-ip")
 
     repo = Path(__file__).resolve().parent.parent
     output = Path(args.output_config).resolve()
@@ -33,6 +36,8 @@ def main():
     command = ["cargo", "run", "--locked", "--target", host, "--manifest-path", str(repo / "Cargo.toml"), "--", "pair", "--output", str(output)]
     if args.bridge_ip:
         command.extend(["--bridge", args.bridge_ip])
+    if args.emulated_bridge:
+        command.append("--emulated-bridge")
     subprocess.run(command, cwd=repo, check=True)
 
 

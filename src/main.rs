@@ -79,6 +79,10 @@ enum Commands {
         bridge: Option<String>,
         #[arg(short, long, default_value = "config.json")]
         output: PathBuf,
+        /// Pair a bridge emulator (for example Bifrost) at the explicit --bridge address: trust
+        /// its self-signed certificate on first use and accept only that certificate afterwards
+        #[arg(long, requires = "bridge")]
+        emulated_bridge: bool,
     },
     /// Re-sync entertainment area and 3D light coordinates from Philips Hue app
     SyncHue {
@@ -113,7 +117,18 @@ async fn main() -> Result<()> {
             config,
             raw_nv12_stats,
         } => run_test_capture(config, raw_nv12_stats).await,
-        Commands::Pair { bridge, output } => run_pair(bridge, output).await,
+        Commands::Pair {
+            bridge,
+            output,
+            emulated_bridge,
+        } => {
+            let kind = if emulated_bridge {
+                hue::BridgeKind::Emulated
+            } else {
+                hue::BridgeKind::Real
+            };
+            run_pair(bridge, output, kind).await
+        }
         Commands::SyncHue { config, area } => run_sync_hue(config, area).await,
         Commands::PairNanoleaf { ip, config } => run_pair_nanoleaf(ip, config).await,
     }

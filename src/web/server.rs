@@ -625,6 +625,26 @@ struct PairRequest {
 }
 
 #[derive(Deserialize, ToSchema)]
+struct HuePairRequest {
+    /// Bridge IP; omitted or blank enables discovery. Required for an emulated bridge.
+    ip: Option<String>,
+    /// Pair a bridge emulator (for example Bifrost): trust its self-signed certificate on first
+    /// use and accept only that certificate afterwards. Omitted means a real Hue bridge.
+    #[serde(default)]
+    emulated_bridge: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+struct HuePairResponse {
+    status: &'static str,
+    /// Present only for an emulated bridge: the pinned identity, for the user to check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridge_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_sha256: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
 struct SelectHueAreaRequest {
     area_id: String,
 }
@@ -1413,10 +1433,10 @@ const HUE_PAIRING_FAILED: &str =
 /// Pair Hue (45-second pairing window), save credentials and queue reconfiguration.
 #[utoipa::path(
     post, path = "/api/pair/hue", tag = "LG Hue Sync",
-    request_body = PairRequest,
+    request_body = HuePairRequest,
     responses(
         (status = 409, description = "Another pairing or Hue area operation is running", body = ErrorResponse),
-        (status = 200, description = "Success", body = StatusMessage),
+        (status = 200, description = "Success", body = HuePairResponse),
         (status = 400, description = "Invalid request", content((ErrorResponse = "application/json"), (String = "text/plain"))),
         (status = 413, description = "Request body exceeds the 16 KiB limit", body = String, content_type = "text/plain"),
         (status = 415, description = "JSON content type required", body = String, content_type = "text/plain"),
@@ -1426,25 +1446,36 @@ const HUE_PAIRING_FAILED: &str =
 )]
 async fn pair_hue(
     State(state): State<AppState>,
-    Json(request): Json<PairRequest>,
-) -> Result<Json<StatusMessage>, ApiError> {
+    Json(request): Json<HuePairRequest>,
+) -> Result<Json<HuePairResponse>, ApiError> {
     let config_path = state.config_path.clone();
     let bridge_ip = request.ip.filter(|ip| !ip.trim().is_empty());
+    let kind = if request.emulated_bridge {
+        hue::BridgeKind::Emulated
+    } else {
+        hue::BridgeKind::Real
+    };
     let permit = claim_setup(&state)?;
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let bridge_ip = match bridge_ip {
             Some(ip) => validate_device_ip(&ip)?,
+            // Trust on first use needs an address the user chose, never a discovered one.
+            None if !kind.is_real() => {
+                return Err("Enter the emulated bridge IP; it is never discovered".to_string());
+            }
             None => {
                 validate_device_ip(&hue::discover_bridge().map_err(|error| error.to_string())?)?
             }
         };
         // One reply for every cause: distinct connect and TLS errors would let a client probe
         // whether TCP 443 is open on any host. The log keeps the cause.
-        let paired = hue::pair_bridge(&bridge_ip, 45).map_err(|error| {
+        let paired = hue::pair_bridge(&bridge_ip, 45, kind).map_err(|error| {
             tracing::warn!("Hue pairing failed: {error:#}");
             HUE_PAIRING_FAILED.to_string()
         })?;
+        let pinned = (!paired.kind.is_real())
+            .then(|| (paired.bridge_id.clone(), paired.certificate_sha256.clone()));
         Config::update(
             &config_path,
             Some(Config::new_default("", "", "", "")),
@@ -1453,17 +1484,22 @@ async fn pair_hue(
                 Ok(())
             },
         )
-        .map(|_| ())
+        .map(|_| pinned)
         .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| ApiError::SetupFailed(format!("Hue pairing task failed: {error}")))?;
-    result.map_err(ApiError::SetupFailed)?;
+    let pinned = result.map_err(ApiError::SetupFailed)?;
     state
         .shared
         .send_command(ControlCommand::Reconfigure)
         .await?;
-    Ok(Json(StatusMessage { status: "paired" }))
+    let (bridge_id, certificate_sha256) = pinned.unzip();
+    Ok(Json(HuePairResponse {
+        status: "paired",
+        bridge_id,
+        certificate_sha256,
+    }))
 }
 
 /// Pair Nanoleaf (45-second pairing window), save credentials and queue reconfiguration.

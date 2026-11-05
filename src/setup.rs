@@ -4,9 +4,17 @@ use anyhow::Result;
 use std::path::PathBuf;
 use tracing::info;
 
-pub(crate) async fn run_pair(bridge_opt: Option<String>, output: PathBuf) -> Result<()> {
+pub(crate) async fn run_pair(
+    bridge_opt: Option<String>,
+    output: PathBuf,
+    kind: hue::BridgeKind,
+) -> Result<()> {
     let bridge_ip = match bridge_opt {
         Some(ip) => ip,
+        // Trust on first use needs an address the user chose, never a discovered one.
+        None if !kind.is_real() => {
+            anyhow::bail!("Pairing an emulated bridge needs its explicit --bridge address");
+        }
         None => match hue::discover_bridge() {
             Ok(ip) => ip,
             Err(e) => {
@@ -24,7 +32,15 @@ pub(crate) async fn run_pair(bridge_opt: Option<String>, output: PathBuf) -> Res
         },
     };
 
-    let paired = hue::pair_bridge(&bridge_ip, 45)?;
+    let paired = hue::pair_bridge(&bridge_ip, 45, kind)?;
+    if !paired.kind.is_real() {
+        println!(
+            "Emulated Hue Bridge {} at {bridge_ip}: its self-signed certificate is trusted on first use.",
+            paired.bridge_id
+        );
+        println!("Pinned certificate SHA-256: {}", paired.certificate_sha256);
+        println!("Only this certificate is accepted from now on; re-pair to trust another one.");
+    }
     let needs_area = paired.area.is_none();
     Config::update(
         &output,

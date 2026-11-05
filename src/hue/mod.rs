@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 pub use discovery::discover_bridge;
 pub use dtls::HueDtlsClient;
 pub use stream::HueStreamPacketBuilder;
-pub use tls::{connect_bridge_tls, peer_bridge_id, BridgeTrust};
+pub use tls::{connect_bridge_tls, peer_bridge_id, BridgeKind, BridgeTrust};
 
 #[derive(Debug, Clone)]
 pub struct EntertainmentArea {
@@ -42,17 +42,29 @@ pub struct PairedBridge {
     pub area: Option<EntertainmentArea>,
     pub bridge_id: String,
     pub certificate_sha256: String,
+    pub kind: BridgeKind,
 }
 
 /// Pair over CA-verified HTTPS after validating the bridge identity, never falling back to HTTP.
-pub fn pair_bridge(bridge_ip: &str, timeout_secs: u64) -> Result<PairedBridge> {
+/// An emulated bridge, chosen explicitly, is pinned on first use instead: every request, the
+/// first one included, must match its certificate SHA-256. The caller shows that pin to the
+/// user (CLI output or dashboard reply), never in the daemon log.
+pub fn pair_bridge(bridge_ip: &str, timeout_secs: u64, kind: BridgeKind) -> Result<PairedBridge> {
+    let first_use = match kind {
+        BridgeKind::Real => None,
+        BridgeKind::Emulated => Some(tls::emulated_bridge_identity(bridge_ip)?.1),
+    };
     let identity = raw_request(
         bridge_ip,
         "",
         "GET",
         "/api/0/config",
         None,
-        BridgeTrust::default(),
+        BridgeTrust {
+            certificate_sha256: first_use.as_deref(),
+            kind,
+            ..BridgeTrust::default()
+        },
     )?;
     let config: Value = serde_json::from_slice(&identity.body)?;
     if !config
@@ -66,10 +78,14 @@ pub fn pair_bridge(bridge_ip: &str, timeout_secs: u64) -> Result<PairedBridge> {
     }
     let trust = BridgeTrust {
         bridge_id: Some(&identity.bridge_id),
-        certificate_sha256: None,
+        // Real bridges trust the Hue roots and the ID; an emulated bridge keeps its pin.
+        certificate_sha256: first_use.as_deref(),
+        kind,
     };
     let payload = serde_json::json!({ "devicetype": "lg-hue-sync#tv", "generateclientkey": true });
-    println!("Press the round button on your Philips Hue Bridge to pair.");
+    if kind.is_real() {
+        println!("Press the round button on your Philips Hue Bridge to pair.");
+    }
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(timeout_secs) {
         let (response, _) = v2_request(bridge_ip, "", "POST", "/api", Some(&payload), trust)?;
@@ -102,6 +118,7 @@ pub fn pair_bridge(bridge_ip: &str, timeout_secs: u64) -> Result<PairedBridge> {
                 area,
                 bridge_id: identity.bridge_id,
                 certificate_sha256: identity.certificate_sha256,
+                kind,
             });
         }
         if response.pointer("/0/error/type").and_then(Value::as_i64) != Some(101) {
@@ -131,9 +148,11 @@ pub fn sync_entertainment_areas(
     let configurations: Value = serde_json::from_slice(&response.body)?;
     let certificate_sha256 = response.certificate_sha256;
     let bridge_id = response.bridge_id;
+    // The certificate's bridge ID now backs the trust. A real bridge ignores a legacy pin once
+    // an ID is known; an emulated bridge keeps its pin and kind.
     let trust = BridgeTrust {
         bridge_id: Some(&bridge_id),
-        certificate_sha256: None,
+        ..trust
     };
     let configuration_data = configurations
         .get("data")
