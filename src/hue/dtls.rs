@@ -3,7 +3,7 @@ use openssl::ssl::{HandshakeError, SslConnector, SslMethod, SslStream, SslVerify
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct ConnectedUdpSocket {
@@ -63,6 +63,8 @@ const RETRY_PAUSE: Duration = Duration::from_millis(200);
 /// An attempt shorter than this cannot complete a handshake with the bridge, so it is not started.
 const MIN_ATTEMPT_WINDOW: Duration = Duration::from_millis(250);
 const MAX_HANDSHAKE_ATTEMPTS: u32 = 5;
+/// Bound of the close_notify write, so a stop path never waits longer for it.
+const CLOSE_NOTIFY_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AttemptPlan {
@@ -254,6 +256,30 @@ impl HueDtlsClient {
         self.stream.write_all(packet)?;
         self.stream.flush()?;
         Ok(())
+    }
+}
+
+/// Ends our DTLS session with a close_notify alert when the client goes away, so the bridge
+/// frees the session at once instead of waiting about 10 s of silence. Every stop path drops
+/// the client before its HTTPS stop request: the alert reaches a session the bridge still
+/// holds, and the stop request that follows stays the authoritative release, as before.
+/// Best effort: one datagram, no wait for the bridge's reply, errors at debug level only.
+impl Drop for HueDtlsClient {
+    fn drop(&mut self) {
+        if let Err(error) = self
+            .stream
+            .get_ref()
+            .socket
+            .set_write_timeout(Some(CLOSE_NOTIFY_TIMEOUT))
+        {
+            debug!("DTLS close_notify skipped: {error}");
+            return;
+        }
+        // The first SSL_shutdown call only sends close_notify; it never reads.
+        match self.stream.shutdown() {
+            Ok(_) => debug!("DTLS close_notify sent to the Hue Bridge"),
+            Err(error) => debug!("DTLS close_notify not sent: {}", describe_ssl_error(&error)),
+        }
     }
 }
 
@@ -481,5 +507,65 @@ mod tests {
         // The lost datagram cost one attempt window, not the whole deadline.
         assert!(elapsed >= ATTEMPT_TIMEOUT, "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    #[test]
+    fn dropping_the_client_sends_close_notify_without_waiting_for_a_reply() {
+        use openssl::ssl::{Ssl, SslContext};
+
+        // Test-only values, never a real bridge credential.
+        const APPLICATION_ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+        const PSK: [u8; 16] = [9; 16];
+
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let (len, source) = peer.recv_from(&mut buf).unwrap();
+            peer.connect(source).unwrap();
+            let mut context = SslContext::builder(SslMethod::dtls()).unwrap();
+            context
+                .set_min_proto_version(Some(SslVersion::DTLS1_2))
+                .unwrap();
+            context
+                .set_max_proto_version(Some(SslVersion::DTLS1_2))
+                .unwrap();
+            context.set_cipher_list("PSK-AES128-GCM-SHA256").unwrap();
+            context.set_psk_server_callback(|_ssl, _identity, psk_buf| {
+                psk_buf[..PSK.len()].copy_from_slice(&PSK);
+                Ok(PSK.len())
+            });
+            let mut result = Ssl::new(&context.build()).unwrap().accept(PeerTransport {
+                socket: peer,
+                pending: Some(buf[..len].to_vec()),
+            });
+            let mut stream = loop {
+                match result {
+                    Ok(stream) => break stream,
+                    Err(HandshakeError::WouldBlock(mid)) => result = mid.handshake(),
+                    Err(error) => panic!("fake bridge handshake failed: {error}"),
+                }
+            };
+            let mut packet = [0u8; 64];
+            let len = stream.read(&mut packet).unwrap();
+            assert_eq!(&packet[..len], b"huestream");
+            // A close_notify ends the read with 0 bytes, long before the 5 s read timeout.
+            let started = Instant::now();
+            let closed = stream.read(&mut packet).unwrap();
+            (closed, started.elapsed())
+        });
+
+        let connector = build_connector(APPLICATION_ID, PSK).unwrap();
+        let mut client = HueDtlsClient::connect_to(&connector, peer_addr).unwrap();
+        client.send(b"huestream").unwrap();
+        let started = Instant::now();
+        drop(client);
+        let dropped_in = started.elapsed();
+        let (closed, waited) = server.join().unwrap();
+
+        assert_eq!(closed, 0);
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert!(dropped_in < CLOSE_NOTIFY_TIMEOUT * 2, "{dropped_in:?}");
     }
 }

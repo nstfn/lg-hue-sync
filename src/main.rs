@@ -2172,6 +2172,8 @@ async fn run_test_pattern(config_path: PathBuf) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await; // 50 Hz fast cadence
     }
 
+    // Send close_notify (on drop) before the stop request, the order the daemon's stop paths use.
+    drop(dtls_client);
     set_hue_stream_active(&config, false)?;
 
     info!("[+] Hue test pattern completed successfully!");
