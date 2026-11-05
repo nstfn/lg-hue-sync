@@ -479,8 +479,18 @@ La capture doit échouer (`vtCapture_init` rend 11 après 30 s). Remettre ensuit
 for R in luna-service2 luna-service2-dev; do cp -p $B/$R/roles.d.org.webosbrew.lg-hue-sync.json /var/$R/roles.d/org.webosbrew.lg-hue-sync.json; cp -p $B/$R/client-permissions.d.org.webosbrew.lg-hue-sync.json /var/$R/client-permissions.d/org.webosbrew.lg-hue-sync.json; done; ls-control scan-services; systemctl restart lg-hue-sync
 ```
 
-**Attention** : `scripts/deploy.sh` et `make provision` lancent `scripts/provision_luna.sh`, qui remet les droits larges.
-Après l'un d'eux, refaire 3d.
+`scripts/deploy.sh`, `make deploy-bin` et `make provision-luna` lancent `scripts/provision_luna.sh`.
+Ce script garde un rôle `"type": "regular"` : il affiche `[=] … keeps its least-privilege role` et ne touche pas aux fichiers de ce dossier Luna.
+Il écrit les droits larges seulement là où le rôle manque ou est `privileged`.
+Pour revenir aux droits larges, supprimer d'abord le fichier `roles.d` du rôle `regular`.
+
+## Mettre à jour le binaire
+
+`make deploy-bin TV_IP=<tv-ip>` convient à ce déploiement :
+
+- L'étape Luna garde les droits minimaux (voir la fin de l'étape 3).
+- `scripts/swap_binary.sh` remplace seulement le binaire et ne touche pas à `state/config.json`.
+- `make deploy-config`, `make pair` et `make test-capture` lisent le chemin de la config dans l'option `--config` de l'unité installée, donc `state/config.json`.
 
 ## En cas de gros pépin
 

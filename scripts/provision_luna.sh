@@ -116,6 +116,13 @@ provision_files() {
     local root dir
     for root in /var/luna-service2 /var/luna-service2-dev; do
         dir="$LUNA_PREFIX$root"
+        # deploy/webos11 step 3 installs a least-privilege "regular" role; this
+        # script writes the "privileged" default. Never widen narrowed rights on
+        # an update: to go back to the default, delete that role file first.
+        if grep -qs '"type": *"regular"' "$dir/roles.d/$NAME.json"; then
+            echo "[=] $root keeps its least-privilege role (deploy/webos11); not overwritten."
+            continue
+        fi
         mkdir -p "$dir/manifests.d" "$dir/roles.d" "$dir/client-permissions.d"
         manifest_json "$root" | install_json "$dir/manifests.d/$NAME.json"
         role_json | install_json "$dir/roles.d/$NAME.json"
@@ -124,7 +131,7 @@ provision_files() {
 
     # stdin may be this script on the remote path: keep it from ls-control.
     ls-control scan-services < /dev/null
-    echo "[+] Luna permissions provisioned and scanned successfully."
+    echo "[+] Luna permissions checked and scanned successfully."
 }
 
 if [ "$TV_IP" = "local" ] || [ "$TV_IP" = "localhost" ] || [ "$TV_IP" = "127.0.0.1" ]; then

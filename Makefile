@@ -13,6 +13,9 @@ SSH_PORT       ?= 22
 TARGET         := armv7-unknown-linux-gnueabi
 BINARY         := target/$(TARGET)/release/lg-hue-sync
 REMOTE_DIR     := /var/home/root/lg-hue-sync
+# The config path the installed unit passes with --config. The webOS 11 hardened layout
+# (deploy/webos11) keeps it in state/. The TV's shell expands this inside a quoted ssh command.
+REMOTE_CONFIG  = \$$(systemctl cat lg-hue-sync 2>/dev/null | sed -n 's|^ExecStart=.*--config \([^ ]*\).*|\1|p' | tail -n 1 | grep . || echo $(REMOTE_DIR)/config.json)
 RUST_VERSION   ?= stable
 CROSS_IMAGE    ?= lg-hue-sync-cross:rust-$(RUST_VERSION)
 CARGO_CACHE    ?= lg-hue-sync-cargo
@@ -98,11 +101,10 @@ setup:
 	cargo fetch --locked
 
 ## run the host validation gate used by CI
-check: release-check
+check: release-check dashboard-check
 	cargo fmt --all -- --check
 	cargo nextest run --locked
 	cargo clippy --bin lg-hue-sync -- -D warnings
-	perl -0777 -ne 'print $$1 if /<script>(.*)<\/script>/s' src/web/ui.html | node --check -
 	git diff --check
 
 ## default TV build; never silently fall back to another toolchain
@@ -207,7 +209,7 @@ deploy-config: require-tv
 	@printf "$(CYAN)[*] Deploying config.json to root@$(TV_IP)...$(RESET)\n"
 	ssh $(SSH_OPTS) root@$(TV_IP) "mkdir -p $(REMOTE_DIR)"
 	@# Mode 600 from creation: config.json holds the Hue and Nanoleaf credentials.
-	ssh $(SSH_OPTS) root@$(TV_IP) "umask 077 && cat > $(REMOTE_DIR)/config.json.new && chmod 600 $(REMOTE_DIR)/config.json.new && mv -f $(REMOTE_DIR)/config.json.new $(REMOTE_DIR)/config.json && systemctl restart lg-hue-sync" < config.json
+	ssh $(SSH_OPTS) root@$(TV_IP) "umask 077 && C=$(REMOTE_CONFIG) && cat > \"\$$C.new\" && chmod 600 \"\$$C.new\" && mv -f \"\$$C.new\" \"\$$C\" && systemctl restart lg-hue-sync" < config.json
 	@printf "$(GREEN)[+] Config deployed and service restarted.$(RESET)\n"
 
 ## package and deploy webOS application to Home Dashboard ribbon
@@ -220,7 +222,7 @@ deploy-app: require-tv
 ## run vtcapture screen capture probe on TV over SSH
 test-capture: require-tv
 	@printf "$(CYAN)[*] Running test-capture on TV (160x90 vtcapture HDMI probe)...$(RESET)\n"
-	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync test-capture --config $(REMOTE_DIR)/config.json"
+	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync test-capture --config \"$(REMOTE_CONFIG)\""
 
 ## check daemon systemd service status on TV
 status: require-tv
@@ -255,7 +257,7 @@ root: require-tv
 
 ## pair Hue Bridge and discover entertainment zones
 pair: require-tv
-	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync pair --output $(REMOTE_DIR)/config.json && systemctl restart lg-hue-sync"
+	ssh -t $(SSH_OPTS) root@$(TV_IP) "$(REMOTE_DIR)/lg-hue-sync pair --output \"$(REMOTE_CONFIG)\" && systemctl restart lg-hue-sync"
 
 ## clean cargo target directory
 clean:
@@ -264,3 +266,17 @@ clean:
 cross-clean:
 	@docker image ls --format '{{.Repository}}:{{.Tag}}' --filter 'reference=lg-hue-sync-cross:rust-*' | while IFS= read -r image; do docker image rm "$$image"; done
 	-docker volume rm $(CARGO_CACHE) $(TARGET_CACHE)
+
+# Static frontend assets stay embedded: the TV does not need Bun or Node.
+.PHONY: dashboard-build dashboard-check dashboard-preview
+dashboard-build:
+	bun run --cwd frontend build
+	cp frontend/dist/index.html src/web/ui.html
+
+dashboard-check:
+	bun run --cwd frontend check
+	bun run --cwd frontend test
+	$(MAKE) dashboard-build
+
+dashboard-preview:
+	bun run --cwd frontend dev

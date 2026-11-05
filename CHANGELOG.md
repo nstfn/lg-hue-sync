@@ -8,13 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Opt-in emulated bridge mode for Hue bridge emulators such as Bifrost, which cannot present a Philips-signed HTTPS certificate. `pair --bridge <bridge-ip> --emulated-bridge`, the dashboard's **Emulated bridge** box and `scripts/pair_hue.py --emulated-bridge` pin the emulator's leaf certificate SHA-256 on first use, show it to the user and save `"hue_bridge_kind": "emulated"`. At runtime such a bridge is accepted only on an exact pin match (and the saved Bridge ID): no CA path, no fallback, and rediscovery reaches only an address with the same certificate. The mode needs an explicit address and is never selected implicitly. Configs without the field remain real bridges, and the real-bridge CA and Bridge ID checks are unchanged.
+- Opt-in emulated bridge mode for Hue bridge emulators such as Bifrost, which cannot present a Philips-signed HTTPS certificate. `pair --bridge <bridge-ip> --emulated-bridge`, the dashboard's **Emulated bridge** switch and `scripts/pair_hue.py --emulated-bridge` pin the emulator's leaf certificate SHA-256 on first use, show it to the user and save `"hue_bridge_kind": "emulated"`. At runtime such a bridge is accepted only on an exact pin match (and the saved Bridge ID): no CA path, no fallback, and rediscovery reaches only an address with the same certificate. The mode needs an explicit address and is never selected implicitly. Configs without the field remain real bridges, and the real-bridge CA and Bridge ID checks are unchanged.
 - Emulated pairing accepts only a private (RFC 1918) or link-local IPv4 bridge address, in the CLI, the dashboard and `scripts/pair_hue.py` alike. Before, any LAN client could make the TV pin an emulated bridge at a public address and send its stream there. Real-bridge pairing keeps its address rules.
 - Emulated pairing logs a warning when the certificate chains to the Philips Hue roots: that bridge is real, and its emulated pin would break at the next Philips certificate renewal. Pairing is not refused.
 - The Hue DTLS client sends a close_notify alert when it is dropped, before the HTTPS stop request, in the daemon and in `test-pattern`. The bridge, or an emulator, frees the session at once instead of waiting about 10 s. The alert is best effort: one datagram, at most 100 ms, errors at debug level.
 - Turn the Hue lights off when the TV goes to standby or the system shuts down. The bridge restores the lights' pre-stream state when our Entertainment stream stops, which usually left them on. The daemon now stops our stream first and waits until the stop completes, then sends `{"on":{"on":false}}` through CLIP v2 to each light the Entertainment configuration lists, over the verified HTTPS client, in at most 2 s. At a SIGTERM the order is: the 1 s system-state check, the stream stop (at most 4 s; a later stop skips the lights-off and logs it), then the lights-off, inside a 10 s stop timeout. After a standby lights-off only, a second pass 5 s later catches a late bridge restore: while the TV is still off and no application streams to the area, it re-reads the light states and turns off the lights still on, in at most 2 s, on a worker thread outside the main loop. It acts only when this application was the active streamer, never while another application streams and never with Hue sync off. A SIGTERM counts as a shutdown only when a 1 s bounded `systemctl is-system-running` reports `stopping`, or, without an answer, when the TV was last seen in standby; a service restart or upgrade with the TV on leaves the lights unchanged. The new `config.json` field `tv_off_lights` selects `"off"` (default) or `"restore"` (the previous behaviour).
 
+### Changed
+- Sample Hue gradient-strip segments from the picture edge, like Ambilight. Each segment's position now projects from the picture centre onto the left, top or right edge (a ray towards the bottom goes to the nearer bottom corner). The segment reads a band there: a Gaussian along the edge (sigma 8 % of the side) and an inward decay (exp(-d / 6 %)), cut at 3 sigma and 3 depths. A grey border round a red centre no longer turns the strip red. Room lamps, Nanoleaf zones and manual rectangles keep their sampling. The sampler now builds its spatial weights once per frame size, active area and zone list, instead of on every frame.
+- Query the TV power state once per 2 s round instead of twice. The Luna observer now reads `getPowerState` every round, for power following and for the panel state the dashboard and the source policy use. The web server no longer polls it. A background round older than a dashboard `/api/display` read or change cannot undo it.
+
 ### Fixed
+- Keep the `deploy/webos11` least-privilege Luna rights on updates. `scripts/provision_luna.sh` (run by `make deploy-bin` and `scripts/deploy.sh`) no longer rewrites a `"type": "regular"` role with the privileged default. `make deploy-config`, `make pair` and `make test-capture` now use the config path from the installed unit's `--config`, so they write `state/config.json` in the hardened layout instead of an unread `config.json`.
+- Render the dashboard preview for every Hue output trim that `/api/settings` accepts (0 to 2.5). The preview still used the older 0.25 to 2.0 bounds, so a trim of 0 or 2.5 made each preview request fail with 422.
 - Keep the daemon running when a deploy fails. `scripts/deploy.sh` now uploads, checks, provisions and installs the IPK while the service runs, then stops it only for the final swap and starts it again in the same remote command. `make deploy-bin` uses the same script, `scripts/swap_binary.sh`. It verifies the SHA-256 again just before the swap, and if a step fails after the stop, it restores the previous binary and starts it. `scripts/test_swap_binary.py` covers these cases.
 - Keep a good rollback binary. `lg-hue-sync.previous` changes only when the running binary differs from the new one, so a second deploy of the same build no longer overwrites it.
 - Generated systemd unit: `TimeoutStopSec=10` instead of 3, so the daemon has time to stop the Hue stream and turn the lights off at shutdown (about 7 s). `StartLimitIntervalSec=30min` and `StartLimitBurst=10` stop a crash loop. `Restart=always` and `RestartSec=5` stay: the daemon exits 0 after pairing to reload.
@@ -67,6 +73,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redact the Hue application key, the Hue client key and the Nanoleaf auth token from `Debug` output of the configuration.
 - Accept only a private (RFC 1918) or link-local IPv4 address for Nanoleaf pairing from the dashboard. Accept a Nanoleaf auth token only when it holds ASCII letters and digits, and build Nanoleaf addresses through `SocketAddr`, so an IPv6 address is always bracketed.
 - Request no webOS permissions for the launcher app (`requiredPermissions: []`). It only opens the local dashboard.
+
+## [1.1.0] - 2026-11-03
+
+### Changed
+- Use robust regional colour estimates for Hue and Nanoleaf: trim the lowest and highest 1% of weighted luminance mass, and average bright pixels instead of selecting one brightest pixel.
+- Give identified single-channel Hue fixtures wider Gaussian sampling footprints anchored to their authoritative Hue positions, with gentler independent brightness and colour response. Preserve narrow Nanoleaf 4D perimeter regions, multi-segment Hue gradient channels and legacy/manual geometry.
+- Add regional black-gate hysteresis to reduce threshold chatter while preserving Strict black and whole-screen hold/fade behaviour.
+
+### Fixed
+- Apply black-frame hold/fade only to output copies, preserving normal colour-smoothing history when picture returns.
+- Preserve brightness while smoothing between equally bright colours, and retain authoritative Gaussian centres where footprints meet screen edges.
+
+### Validation
+- Host checks cover 140 Rust tests, 9 frontend tests, Svelte diagnostics, formatting, Clippy and release metadata. Native ARMv7 builds pass ELF32, soft-float, loader and glibc <= 2.28 checks.
+- The pre-version-bump feature build was deployed with matching binary hashes, retained rollback, preserved credentials/settings, active hardware capture and both output connections. The user confirmed Hue Color Lamp 2 stays steady on a paused non-black frame with hold/fade enabled after the output-history correction.
+- Physical black-screen fade and return-to-picture behaviour remain unverified. Published daemon assets are independently built by CI; launcher-only packages and manifests remain unpublished.
+
+## [1.0.2] - 2026-11-03
+
+### Added
+- Hold the last Hue and Nanoleaf colours during whole-screen black interruptions for 750 ms, then fade to off over 2000 ms. Returning picture cancels the fade; individual dark regions retain Strict black behaviour.
+- Add independent hold/fade controls under Processing options, with validated persisted settings and backwards-compatible defaults. Set both durations to zero to disable protection; colour presets preserve them.
+- Add QSync web app installation guidance, a web manifest and embedded icons. Browser support determines installation availability; no offline cache or service worker is installed.
+
+### Fixed
+- Preserve Nanoleaf colour history when live settings resend unchanged alignment. Clear held colours on actual alignment changes, Stop, source pauses and output disable.
+
+### Validation
+- Host checks cover 134 Rust tests, 9 frontend tests, Svelte diagnostics, formatting, Clippy and release metadata. Native ARMv7 builds pass ELF32, soft-float, loader and glibc <= 2.28 checks.
+- The pre-version-bump feature build was installed on the TV with matching binary hashes, a retained rollback binary, active hardware capture and both output connections. Configuration changed only to add the two new timing defaults. Physical fade behaviour remains unverified.
+- Published daemon assets are independently built by Docker CI; launcher-only packages and manifests remain unpublished.
+
+## [1.0.1] - 2026-10-30
+
+### Changed
+- Rebuild the embedded dashboard with Svelte, Tailwind and selected shadcn-svelte components; keep the existing local HTTP API and single-file deployment.
+- Use consistent Item rows and touch-sized Switches for processing/device settings, with pressed Toggles for screen sync, display and light regions.
+- Make Colour, Response and Spatial preset groups independently combinable, automatically save selections, and restore the last saved choices.
+- Add bounded Off/Mild/Strong depth influence while preserving Hue channel centres and separate gradient-channel sampling.
+- Combine capture polling ceiling, measured light-update rate and sender connection status into one diagnostic gauge; distinguish paused, stale and unavailable readings.
+
+### Fixed
+- Add display-only on/off/toggle HTTP controls and pause screen synchronization while the display is off, independently of TV standby power.
+- Keep tuning preview capture explicit and frozen; remove live polling from colour tuning and avoid redundant settings updates.
+- Use practical fader/output-trim steps, place Strict black with Black gate, and group infrequent processing options separately.
+- Harden atomic configuration writes and preserve independent preset overrides and device credentials.
+
+### Validation
+- Host checks cover 127 Rust tests, 9 frontend tests, Svelte diagnostics, formatting, Clippy and release metadata. Native ARMv7 builds pass ELF32, soft-float, loader and glibc <= 2.28 checks.
+- The pre-version-bump UX build was deployed and its binary hash, service, dashboard, hardware capture and Hue/Nanoleaf connections verified. Physical colour accuracy and iPhone haptics were not measured.
+- HLS, native video encoding and audio interception are excluded. CI builds published daemon assets independently; launcher-only packages/manifests remain unpublished.
 
 ## [1.0.0] - 2026-10-29
 

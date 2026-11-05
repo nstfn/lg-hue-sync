@@ -49,6 +49,8 @@ Apple Shortcuts can apply a dashboard preset over the trusted LAN with a `POST` 
 
 ## Install and update
 
+The dashboard includes a web app manifest and QSync icons. In **Devices → QSync app**, find installation guidance or an install button when supported. On iPhone/iPad, use Safari **Share → Add to Home Screen**; on Mac, **File → Add to Dock**. Automatic PWA install prompts require HTTPS (or localhost during development); the TV's plain HTTP LAN address may only support manual installation or a shortcut, depending on the browser. The app requires a reachable TV and does not cache controls or frames offline. No service worker or additional TV process is installed.
+
 First installation, after root SSH already works:
 
 ```bash
@@ -93,7 +95,7 @@ Start from [config.example.json](config.example.json), or pair through the dashb
 /var/home/root/lg-hue-sync/config.json
 ```
 
-Hue HTTPS validates the two official Hue root CAs and the saved Bridge ID. A bridge emulator such as Bifrost pairs only through the explicit `pair --bridge <bridge-ip> --emulated-bridge` option (or the dashboard's **Emulated bridge** box), which pins its self-signed certificate on first use; see [operations](docs/operations.md#emulated-bridge-opt-in). Existing certificate pins bootstrap that identity only on an exact match; subsequent signed certificate renewal retains the identity check. Pairing never falls back to HTTP. Status endpoints never return Hue or Nanoleaf secrets.
+Hue HTTPS validates the two official Hue root CAs and the saved Bridge ID. A bridge emulator such as Bifrost pairs only through the explicit `pair --bridge <bridge-ip> --emulated-bridge` option (or the dashboard's **Emulated bridge** switch), which pins its self-signed certificate on first use; see [operations](docs/operations.md#emulated-bridge-opt-in). Existing certificate pins bootstrap that identity only on an exact match; subsequent signed certificate renewal retains the identity check. Pairing never falls back to HTTP. Status endpoints never return Hue or Nanoleaf secrets.
 
 ## Project layout
 

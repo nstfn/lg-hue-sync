@@ -14,7 +14,7 @@ Rust daemon and LAN dashboard for screen-derived Philips Hue Entertainment and N
 - Ares tools: `ares-rs-*` (official Rust v0.7.0 aliases) or existing Node `ares-*`
 - Launcher packaging: `make package-app`; app management requires `ARES_DEVICE=<registered-name>`. Daemon/service lifecycle stays on SSH. Packaging/build-script tests: `uv run python scripts/test_package_ipk.py` and `uv run python scripts/test_native_toolchain.py`.
 - Zig is experimental: use the pinned isolated command in `docs/operations.md`; ABI inspection alone does not replace TV validation or the Docker fallback.
-- Safe update: `make deploy-bin TV_IP=<tv-ip>`; preserve the paired TV `config.json`
+- Safe update: `make deploy-bin TV_IP=<tv-ip>`; preserve the paired TV `config.json`. Its Luna step keeps a least-privilege `regular` role from `deploy/webos11` and never rewrites it with the privileged default.
 - First install: `./scripts/deploy.sh <tv-ip>`; root SSH must already work
 - Verify: `make status TV_IP=<tv-ip>` and `curl http://<tv-ip>:8088/api/status`
 
@@ -24,7 +24,7 @@ Rust daemon and LAN dashboard for screen-derived Philips Hue Entertainment and N
 - Never commit device IPs, MAC addresses, Hue credentials, Nanoleaf tokens, certificate pins, or populated `config.json` files.
 - A host macOS binary is not deployable. Verify a 32-bit ARM Linux ELF compatible with webOS glibc 2.28.
 - Nix evaluation, host/container checks and ARM builds are separate evidence from a realized Nix shell or TV execution. Retain per-artifact ELF32/little-endian ARM EABI5 soft-float, `/lib/ld-linux.so.3`, and glibc <= 2.28 checks regardless of compiler source.
-- Binary updates preserve `/var/home/root/lg-hue-sync/config.json` and keep a recoverable prior binary.
+- Binary updates preserve the TV config and keep a recoverable prior binary. The config is the unit's `--config` path: `/var/home/root/lg-hue-sync/config.json` by default, `state/config.json` in the `deploy/webos11` hardened layout. Make targets read it from the installed unit.
 - Upload, install, restart, autoroot, Luna mutation, or live light output requires explicit user direction.
 - Verify deployment with local/remote SHA-256, service state, dashboard status, and—when claimed—physical output.
 - Hue v2 channel IDs and grouped gradient members are authoritative; never invent absent channels.

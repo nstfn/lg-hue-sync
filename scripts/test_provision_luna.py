@@ -52,10 +52,14 @@ def manifest(root):
 
 
 class ProvisionTests(unittest.TestCase):
-    def provision(self, target):
+    def provision(self, target, existing=None):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             prefix = base / "root"
+            for path, text in (existing or {}).items():
+                (prefix / path).parent.mkdir(parents=True, exist_ok=True)
+                (prefix / path).write_text(text)
+                (prefix / path).chmod(0o644)
             bin_dir = base / "bin"
             bin_dir.mkdir()
             for name, body in (("ls-control", LS_CONTROL), ("ssh", SSH)):
@@ -100,6 +104,29 @@ class ProvisionTests(unittest.TestCase):
         self.assertIn("ssh -p 22 ", calls)
         self.assertIn("root@192.0.2.10 bash -s -- local", calls)
         self.assertTrue(calls.endswith("ls-control scan-services\n"))
+
+    def test_least_privilege_roots_are_kept_and_others_provisioned(self):
+        # The deploy/webos11 files, byte for byte, as installed on the G4.
+        webos11 = Path(__file__).parent.parent / "deploy/webos11/luna"
+        narrowed = {
+            f"var/luna-service2/roles.d/{NAME}": (webos11 / "role.json").read_text(),
+            f"var/luna-service2/client-permissions.d/{NAME}":
+                (webos11 / "client-permissions.json").read_text(),
+            f"var/luna-service2/manifests.d/{NAME}": "kept manifest",
+            # A privileged role is the script's own default: it is rewritten.
+            f"var/luna-service2-dev/roles.d/{NAME}": json.dumps(ROLE),
+        }
+        files, calls = self.provision("local", narrowed)
+        for path in list(narrowed)[:3]:
+            self.assertEqual(files.pop(path), (narrowed[path], 0o644), path)
+        dev = ROOTS[1]
+        self.assertEqual(set(files), {
+            f"{dev[1:]}/manifests.d/{NAME}",
+            f"{dev[1:]}/roles.d/{NAME}",
+            f"{dev[1:]}/client-permissions.d/{NAME}",
+        })
+        self.assertEqual(json.loads(files[f"{dev[1:]}/roles.d/{NAME}"][0]), ROLE)
+        self.assertEqual(calls, "ls-control scan-services\n")
 
     def test_no_fixed_tmp_name(self):
         self.assertNotIn("/tmp/", SCRIPT.read_text())

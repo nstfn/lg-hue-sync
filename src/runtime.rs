@@ -17,6 +17,7 @@ pub enum PipelineState {
 
 pub struct CaptureSourcePolicy {
     compatible: Option<bool>,
+    display_off: bool,
     source_paused: bool,
     manually_stopped: bool,
 }
@@ -25,6 +26,7 @@ impl CaptureSourcePolicy {
     pub fn new(compatible: Option<bool>, requested: bool) -> Self {
         Self {
             compatible,
+            display_off: false,
             source_paused: compatible == Some(false) && requested,
             manually_stopped: false,
         }
@@ -47,8 +49,12 @@ impl CaptureSourcePolicy {
         }
     }
 
+    pub fn observe_display(&mut self, off: bool) {
+        self.display_off = off;
+    }
+
     pub fn blocked(&self) -> bool {
-        self.compatible == Some(false)
+        self.display_off || self.compatible == Some(false)
     }
     /// Last known source class: `Some(true)` for HDMI, `Some(false)` for a known non-HDMI app.
     pub fn compatible(&self) -> Option<bool> {
@@ -387,6 +393,26 @@ pub fn pause_cause(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn display_pause_resumes_without_overriding_manual_stop() {
+        let mut policy = CaptureSourcePolicy::new(Some(true), true);
+        policy.observe_display(true);
+        assert!(policy.blocked());
+        policy.pause_for_source();
+        assert!(!policy.auto_resume());
+        policy.observe_display(false);
+        assert!(policy.auto_resume());
+        policy.resumed();
+        policy.manual_request(Some(false));
+        policy.observe_display(true);
+        policy.pause_for_source();
+        policy.observe_display(false);
+        assert!(!policy.auto_resume());
+        policy.manual_request(Some(true));
+        policy.observe(Some(false));
+        assert!(policy.blocked());
+    }
+
     use super::*;
 
     #[test]

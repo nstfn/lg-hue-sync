@@ -3,6 +3,9 @@
 //! Each `luna-send` query can take up to its 1.5 s deadline. One background task runs the
 //! foreground-source, TV-power and source-fps queries every 2 s and publishes each round
 //! through a `watch` channel; the frame loop only takes the newest round, never waiting.
+//! The TV-power query runs every round: its reply also gives the panel state, so no other
+//! task polls `getPowerState`. The task hands the panel state to a sink at once, because the
+//! frame loop can wait on its capture backoff (up to 16 s) before it takes a round.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -47,9 +50,12 @@ impl Observations {
 
 type Query<T> = Box<dyn Fn() -> Pin<Box<dyn Future<Output = T> + Send>> + Send + Sync>;
 
+/// Receives each round's start and panel state (`None` in standby, unknown or failed).
+pub type DisplaySink = Box<dyn Fn(Instant, Option<bool>) + Send + Sync>;
+
 pub struct LunaQueries {
     pub source: Query<Option<bool>>,
-    pub power: Query<anyhow::Result<Option<bool>>>,
+    pub power: Query<anyhow::Result<crate::tv_power::PowerState>>,
     pub source_fps: Query<Option<f64>>,
 }
 
@@ -60,7 +66,7 @@ impl LunaQueries {
             source: Box::new(|| {
                 Box::pin(async { crate::capture_source::current_source().await.compatible() })
             }),
-            power: Box::new(|| Box::pin(crate::tv_power::is_active())),
+            power: Box::new(|| Box::pin(crate::tv_power::power_state())),
             source_fps: Box::new(|| Box::pin(crate::capture::detect_source_fps())),
         }
     }
@@ -80,14 +86,20 @@ pub struct LunaObserver {
 
 impl LunaObserver {
     /// Starts the first round at once.
-    pub fn spawn(queries: LunaQueries, period: Duration, power: bool, source_fps: bool) -> Self {
+    pub fn spawn(
+        queries: LunaQueries,
+        period: Duration,
+        power: bool,
+        source_fps: bool,
+        display: DisplaySink,
+    ) -> Self {
         let (sender, receiver) = watch::channel(Observations::default());
         let control = Arc::new(Control {
             power: AtomicBool::new(power),
             source_fps: AtomicBool::new(source_fps),
             wake: Notify::new(),
         });
-        let task = tokio::spawn(poll(queries, period, control.clone(), sender));
+        let task = tokio::spawn(poll(queries, period, control.clone(), sender, display));
         Self {
             receiver,
             control,
@@ -103,7 +115,7 @@ impl LunaObserver {
         }
     }
 
-    /// Takes effect from the next round's power query.
+    /// Publishes `power` from the next round. The query itself runs every round for `display`.
     pub fn set_power(&self, enabled: bool) {
         self.control.power.store(enabled, Ordering::Relaxed);
     }
@@ -131,18 +143,17 @@ async fn poll(
     period: Duration,
     control: Arc<Control>,
     sender: watch::Sender<Observations>,
+    display: DisplaySink,
 ) {
     loop {
         let started = Instant::now();
         let source = (queries.source)().await;
-        let power = if control.power.load(Ordering::Relaxed) {
-            Some(match (queries.power)().await {
-                Ok(state) => PowerObservation::State(state),
-                Err(error) => PowerObservation::Unavailable(error.to_string()),
-            })
-        } else {
-            None
-        };
+        let reply = (queries.power)().await;
+        display(started, reply.as_ref().ok().and_then(|state| state.display));
+        let power = control.power.load(Ordering::Relaxed).then(|| match reply {
+            Ok(state) => PowerObservation::State(state.active),
+            Err(error) => PowerObservation::Unavailable(error.to_string()),
+        });
         let source_fps = if control.source_fps.load(Ordering::Relaxed) {
             (queries.source_fps)().await
         } else {
@@ -180,14 +191,31 @@ mod tests {
                         std::future::pending::<()>().await;
                     }
                     match call % 3 {
-                        0 => Ok(Some(true)),
-                        1 => Ok(Some(false)),
+                        0 => Ok(crate::tv_power::PowerState {
+                            active: Some(true),
+                            display: Some(true),
+                        }),
+                        1 => Ok(crate::tv_power::PowerState {
+                            active: Some(false),
+                            display: Some(false),
+                        }),
                         _ => Err(anyhow::anyhow!("webOS TV power query failed")),
                     }
                 })
             }),
             source_fps: Box::new(|| Box::pin(async { Some(24.0) })),
         }
+    }
+
+    type Panel = Arc<std::sync::Mutex<Vec<Option<bool>>>>;
+
+    fn panel_sink() -> (Panel, DisplaySink) {
+        let panel = Panel::default();
+        let sink = panel.clone();
+        (
+            panel,
+            Box::new(move |_, display| sink.lock().unwrap().push(display)),
+        )
     }
 
     async fn next(observer: &mut LunaObserver) -> Observations {
@@ -206,37 +234,47 @@ mod tests {
     #[tokio::test]
     async fn rounds_publish_only_the_enabled_queries_and_the_newest_values() {
         let calls = Arc::new(AtomicU32::new(0));
+        let (panel, sink) = panel_sink();
         let mut observer = LunaObserver::spawn(
             queries(calls.clone(), false),
             Duration::from_secs(60),
             false,
             false,
+            sink,
         );
         let first = next(&mut observer).await;
         assert_eq!(first.source, Some(true));
         assert_eq!((first.power, first.source_fps), (None, None));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // Power following is off, but the same query still reports the panel.
+        assert_eq!(*panel.lock().unwrap(), [Some(true)]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(observer.take().is_none(), "a round is taken once");
 
         observer.set_power(true);
         observer.set_source_fps(true);
         observer.poll_now();
         let second = next(&mut observer).await;
-        assert_eq!(second.power, Some(PowerObservation::State(Some(true))));
+        assert_eq!(second.power, Some(PowerObservation::State(Some(false))));
         assert_eq!(second.source_fps, Some(24.0));
         assert!(second.started > first.started);
 
         observer.poll_now();
+        let failed = next(&mut observer).await;
         assert_eq!(
-            next(&mut observer).await.power,
-            Some(PowerObservation::State(Some(false)))
+            failed.power,
+            Some(PowerObservation::Unavailable(
+                "webOS TV power query failed".into()
+            ))
         );
         observer.poll_now();
         assert_eq!(
             next(&mut observer).await.power,
-            Some(PowerObservation::Unavailable(
-                "webOS TV power query failed".into()
-            ))
+            Some(PowerObservation::State(Some(true)))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "one power query per round");
+        assert_eq!(
+            *panel.lock().unwrap(),
+            [Some(true), Some(false), None, Some(true)]
         );
     }
 
@@ -248,6 +286,7 @@ mod tests {
             Duration::from_millis(5),
             true,
             false,
+            panel_sink().1,
         );
         let deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < deadline {

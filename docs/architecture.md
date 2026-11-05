@@ -63,6 +63,28 @@ whichever is shorter, including response bodies and the subsequent panel-layout 
 Hue and Nanoleaf sampling share `ColorProcessor` for peak weighting, noise gating, saturation,
 gamma, the legacy midtone lift, temporal response, strict black, and scene-change limits.
 Spatial averages, colour transforms, and temporal state retain fractional RGB until output rounding.
+Highlight colour uses an average weighted by the fourth power of encoded-domain luminance,
+instead of selecting one brightest pixel. This keeps bright accents influential without
+switching the entire highlight colour when nearly tied pixels exchange brightness rank.
+Both means and highlights trim the lowest and highest 1% of weighted luminance mass using
+32 fixed bins with proportional boundary-bin retention. Nanoleaf retains narrow perimeter
+regions and the normal response. Identified single-channel Hue fixtures use 1.5-times wider
+footprints with separable Gaussian weights around their saved Hue centres; multi-segment
+gradient channels and legacy/manual rectangles retain their existing geometry. Reported
+Hue rectangles reflect the expanded footprint. Room fixtures smooth brightness and normalised
+colour separately, at 60% of the ordinary response clock, with colour alpha capped at 0.25.
+Scene cuts still use the existing step limit. Regional black gating uses 1.2-times the configured
+threshold to wake from black and 0.8-times to remain lit; Strict black still turns gated output off.
+Whole-screen black interruptions use a shared hold/fade guard before regional processing:
+every captured RGB component must be at most 3/255 (alpha is ignored). The default holds
+the last colours for 750 ms, then fades them to zero over 2000 ms using elapsed wall time.
+Returning picture cancels the fade and resumes normal temporal processing from the retained
+sampling history. Hold/fade modifies an output copy only. Letterbox detection is frozen during the interruption; dark regions in a non-black
+frame still obey strict black. Both outputs expose `black_frame_hold_ms` (0–5000) and
+`black_frame_fade_ms` (0–10000) in Processing options; setting both to zero disables the guard.
+These defaults also apply to older configuration files. Colour presets leave these timings
+unchanged. Stop, unsupported sources and output disable retain priority and clear held state;
+this guard does not mask capture errors or delay releasing capture/session ownership.
 These values remain in the existing encoded RGB domain; this does not establish HDR decoding.
 [Palette](https://docs.rs/palette/0.7.7/palette/) owns RGB mixing, RGB/HSV conversions, and
 the sRGB decoding used before the existing Hue-specific XYZ matrix. Saturation remains
@@ -92,6 +114,17 @@ bounded exponential-backoff policy so a disconnected device cannot trigger frame
 - This daemon: Nanoleaf edge mapping and alignment offset/direction.
 
 Hue v2 may group several physical gradient segments into one Entertainment channel. Preserve that grouping. Dashboard overlays describe daemon sampling; they are not additional Bridge channels.
+
+Hue sampling uses each channel's authoritative centre, with X mapped horizontally and Z vertically.
+The base footprint is 25% of each screen axis before clipping. `depth_influence` (0–1, default 0.5)
+controls bounded expansion: for normalized rearward depth `d = clamp((1 - Y) / 2)`, the span is
+`0.25 * (1 + 0.5 * depth_influence * d*d*(3 - 2*d))`. Off stays at 25%; Mild reaches 31.25%;
+Strong reaches 37.5%. This is QSync policy, not a Hue-prescribed projection or measured beam size.
+The setting applies to Hue only and is saved independently of colour/response/blend presets.
+Changes update sampling and reported rectangles without reconnecting Hue or resetting temporal state.
+Legacy/manual rectangles without `hue_channel_position` retain their bounds until a Hue layout refresh
+supplies authoritative channel coordinates. Device preview boxes enclose member rectangles; empty gaps
+inside that enclosure are not additional sampled pixels. Edge clipping can reduce the visible footprint.
 
 ## Security
 
