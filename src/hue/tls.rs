@@ -334,7 +334,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("does not match the pin"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("does not match the pin"),
+            "{error:#}"
+        );
 
         let error = connect_once(
             &identity,
@@ -345,7 +348,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("identity changed"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("identity changed"),
+            "{error:#}"
+        );
 
         // No pin: refused before any connection, even with a saved bridge ID.
         let unpinned = BridgeTrust {
@@ -355,7 +361,10 @@ mod tests {
         };
         assert!(!unpinned.known());
         let error = connect_bridge_tls_on("127.0.0.1", 9, unpinned).unwrap_err();
-        assert!(format!("{error:#}").contains("no certificate pin"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("no certificate pin"),
+            "{error:#}"
+        );
         let malformed = BridgeTrust {
             certificate_sha256: Some("not-a-sha256"),
             ..unpinned

@@ -920,7 +920,10 @@ mod tests {
         let trust = config.hue_trust();
         assert_eq!(trust.kind, BridgeKind::Emulated);
         assert_eq!(trust.certificate_sha256, Some("aa".repeat(32).as_str()));
-        assert_eq!(serde_json::to_value(&config).unwrap()["hue_bridge_kind"], "emulated");
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["hue_bridge_kind"],
+            "emulated"
+        );
         value["hue_bridge_kind"] = "bifrost".into();
         assert!(serde_json::from_value::<Config>(value).is_err());
 
@@ -939,7 +942,10 @@ mod tests {
         config.apply_hue_pairing("192.0.2.1".into(), paired(BridgeKind::Emulated));
         assert_eq!(config.hue_bridge_kind, BridgeKind::Emulated);
         let pin = "bb".repeat(32);
-        assert_eq!(config.hue_bridge_certificate_sha256.as_deref(), Some(pin.as_str()));
+        assert_eq!(
+            config.hue_bridge_certificate_sha256.as_deref(),
+            Some(pin.as_str())
+        );
     }
 
     #[test]
