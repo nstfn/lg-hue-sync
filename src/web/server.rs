@@ -1458,16 +1458,7 @@ async fn pair_hue(
     let permit = claim_setup(&state)?;
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let bridge_ip = match bridge_ip {
-            Some(ip) => validate_device_ip(&ip)?,
-            // Trust on first use needs an address the user chose, never a discovered one.
-            None if !kind.is_real() => {
-                return Err("Enter the emulated bridge IP; it is never discovered".to_string());
-            }
-            None => {
-                validate_device_ip(&hue::discover_bridge().map_err(|error| error.to_string())?)?
-            }
-        };
+        let bridge_ip = hue_pairing_address(bridge_ip, kind)?;
         // One reply for every cause: distinct connect and TLS errors would let a client probe
         // whether TCP 443 is open on any host. The log keeps the cause.
         let paired = hue::pair_bridge(&bridge_ip, 45, kind).map_err(|error| {
@@ -1560,6 +1551,23 @@ async fn pair_nanoleaf(
         .send_command(ControlCommand::Reconfigure)
         .await?;
     Ok(Json(StatusMessage { status: "paired" }))
+}
+
+/// The address to pair. An emulated bridge needs the address the user typed, and the same
+/// private-IPv4 check `pair_bridge` applies, here with a clear reply instead of the generic
+/// pairing failure. A real bridge keeps the device-address rule and discovery.
+fn hue_pairing_address(ip: Option<String>, kind: hue::BridgeKind) -> Result<String, String> {
+    match ip {
+        Some(ip) if !kind.is_real() => hue::emulated_bridge_address(&ip)
+            .map(|ip| ip.to_string())
+            .map_err(|error| error.to_string()),
+        Some(ip) => validate_device_ip(&ip),
+        // Trust on first use needs an address the user chose, never a discovered one.
+        None if !kind.is_real() => {
+            Err("Enter the emulated bridge IP; it is never discovered".to_string())
+        }
+        None => validate_device_ip(&hue::discover_bridge().map_err(|error| error.to_string())?),
+    }
 }
 
 /// Nanoleaf controllers sit on the LAN: only private (RFC 1918) or link-local IPv4 unicast.
@@ -2210,6 +2218,60 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
             serde_json::json!({"error": "sync controller is unavailable"})
+        );
+    }
+
+    #[tokio::test]
+    async fn emulated_hue_pairing_refuses_a_missing_or_public_address() {
+        let (sender, _commands) = mpsc::channel(1);
+        let (bonjour, _changes) = watch::channel(false);
+        let state = AppState {
+            shared: Arc::new(SharedState::new(
+                settings(),
+                String::new(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+                sender,
+            )),
+            // Never written: every request below is refused before pairing.
+            config_path: std::env::temp_dir()
+                .join(format!("lg-hue-sync-emulated-{}", std::process::id()))
+                .join("config.json"),
+            bonjour: Arc::new(Mutex::new(bonjour)),
+        };
+        // 192.0.2.0/24 is a documentation range: public, and never routed.
+        for (ip, expected) in [
+            (None, "never discovered"),
+            (Some("  "), "never discovered"),
+            (Some("192.0.2.10"), "must be a private IPv4 address"),
+            (Some("127.0.0.1"), "must be a private IPv4 address"),
+            (Some("fd00::1"), "must be a private IPv4 address"),
+        ] {
+            let result = pair_hue(
+                State(state.clone()),
+                Json(HuePairRequest {
+                    ip: ip.map(str::to_string),
+                    emulated_bridge: true,
+                }),
+            )
+            .await;
+            match result {
+                Err(ApiError::SetupFailed(message)) => {
+                    assert!(message.contains(expected), "{ip:?}: {message}")
+                }
+                _ => panic!("{ip:?}: emulated pairing was not refused"),
+            }
+        }
+        assert!(!state.config_path.exists());
+        // Real-bridge pairing keeps its rules: a public address is still a device address.
+        assert_eq!(
+            hue_pairing_address(Some("192.0.2.10".into()), hue::BridgeKind::Real).unwrap(),
+            "192.0.2.10"
+        );
+        assert_eq!(
+            hue_pairing_address(Some(" 192.168.1.20 ".into()), hue::BridgeKind::Emulated).unwrap(),
+            "192.168.1.20"
         );
     }
 

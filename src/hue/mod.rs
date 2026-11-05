@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 pub use discovery::discover_bridge;
 pub use dtls::HueDtlsClient;
 pub use stream::HueStreamPacketBuilder;
-pub use tls::{connect_bridge_tls, peer_bridge_id, BridgeKind, BridgeTrust};
+pub use tls::{
+    connect_bridge_tls, emulated_bridge_address, peer_bridge_id, BridgeKind, BridgeTrust,
+};
 
 #[derive(Debug, Clone)]
 pub struct EntertainmentArea {
@@ -52,7 +54,18 @@ pub struct PairedBridge {
 pub fn pair_bridge(bridge_ip: &str, timeout_secs: u64, kind: BridgeKind) -> Result<PairedBridge> {
     let first_use = match kind {
         BridgeKind::Real => None,
-        BridgeKind::Emulated => Some(tls::emulated_bridge_identity(bridge_ip)?.1),
+        BridgeKind::Emulated => {
+            // Refuses any address other than a private or link-local IPv4 before connecting.
+            let seen = tls::emulated_bridge_identity(bridge_ip)?;
+            if seen.signed_by_hue_roots {
+                // Not refused: the user chose this mode. The pin would break at the next
+                // Philips certificate renewal, which real-bridge mode accepts.
+                tracing::warn!(
+                    "The bridge at {bridge_ip} presents a Philips Hue certificate: it is a real Hue Bridge. Pair it without --emulated-bridge; an emulated pin breaks when Philips renews the certificate."
+                );
+            }
+            Some(seen.certificate_sha256)
+        }
     };
     let identity = raw_request(
         bridge_ip,
@@ -129,6 +142,15 @@ pub fn pair_bridge(bridge_ip: &str, timeout_secs: u64, kind: BridgeKind) -> Resu
     Err(anyhow!("Timed out waiting for Hue Bridge button press"))
 }
 
+/// The certificate's bridge ID now backs the trust. A real bridge ignores a legacy pin once
+/// an ID is known; an emulated bridge keeps its pin and kind.
+fn area_sync_trust<'a>(trust: BridgeTrust<'a>, bridge_id: &'a str) -> BridgeTrust<'a> {
+    BridgeTrust {
+        bridge_id: Some(bridge_id),
+        ..trust
+    }
+}
+
 /// Queries the Hue Bridge for Entertainment Areas and translates 3D light coordinates into screen sampling zones.
 /// If `target_area` is specified, selects by ID or name; otherwise requires exactly one area.
 pub fn sync_entertainment_areas(
@@ -148,12 +170,7 @@ pub fn sync_entertainment_areas(
     let configurations: Value = serde_json::from_slice(&response.body)?;
     let certificate_sha256 = response.certificate_sha256;
     let bridge_id = response.bridge_id;
-    // The certificate's bridge ID now backs the trust. A real bridge ignores a legacy pin once
-    // an ID is known; an emulated bridge keeps its pin and kind.
-    let trust = BridgeTrust {
-        bridge_id: Some(&bridge_id),
-        ..trust
-    };
+    let trust = area_sync_trust(trust, &bridge_id);
     let configuration_data = configurations
         .get("data")
         .and_then(Value::as_array)
@@ -1379,5 +1396,26 @@ mod tests {
         assert_eq!(zones[1].name, "Hue Flux ultra bright SL 1 · Segments 3–7");
         assert_eq!(zones[0].hue_segment_count, Some(7));
         assert_eq!(zones[1].hue_segment_count, Some(7));
+    }
+
+    #[test]
+    fn area_sync_keeps_the_emulated_pin_and_kind_once_the_bridge_id_is_known() {
+        let pin = "ab".repeat(32);
+        let id = "001788fffe000001";
+        let emulated = BridgeTrust {
+            bridge_id: None,
+            certificate_sha256: Some(&pin),
+            kind: BridgeKind::Emulated,
+        };
+        let trust = area_sync_trust(emulated, id);
+        assert_eq!(trust.bridge_id, Some(id));
+        assert_eq!(trust.certificate_sha256, Some(pin.as_str()));
+        assert_eq!(trust.kind, BridgeKind::Emulated);
+        assert!(trust.known());
+        // A real bridge keeps its kind; with an ID saved, its legacy pin no longer decides.
+        let real = area_sync_trust(BridgeTrust::default(), id);
+        assert_eq!(real.bridge_id, Some(id));
+        assert_eq!(real.kind, BridgeKind::Real);
+        assert_eq!(real.certificate_sha256, None);
     }
 }

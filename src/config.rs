@@ -924,8 +924,20 @@ mod tests {
             serde_json::to_value(&config).unwrap()["hue_bridge_kind"],
             "emulated"
         );
-        value["hue_bridge_kind"] = "bifrost".into();
-        assert!(serde_json::from_value::<Config>(value).is_err());
+        // Any other value fails closed: the config does not load, so it can neither turn an
+        // emulated pin into real-bridge trust nor select emulated mode by accident.
+        for invalid in [
+            serde_json::json!("bifrost"),
+            serde_json::json!("Emulated"),
+            serde_json::json!("REAL"),
+            serde_json::Value::Null,
+        ] {
+            value["hue_bridge_kind"] = invalid.clone();
+            assert!(
+                serde_json::from_value::<Config>(value.clone()).is_err(),
+                "{invalid} accepted"
+            );
+        }
 
         // Re-pairing replaces the kind: emulated to real and back.
         let mut config = config;

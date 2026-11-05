@@ -2,8 +2,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
-use openssl::x509::store::{X509Store, X509StoreBuilder};
-use openssl::x509::X509;
+use openssl::stack::{Stack, StackRef};
+use openssl::x509::store::{X509Store, X509StoreBuilder, X509StoreRef};
+use openssl::x509::{X509Ref, X509StoreContext, X509};
 use std::net::{IpAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -51,14 +52,38 @@ pub fn connect_bridge_tls(bridge_ip: &str, trust: BridgeTrust<'_>) -> Result<Ssl
     connect_bridge_tls_on(bridge_ip, HTTPS_PORT, trust)
 }
 
-/// Trust on first use, for an explicit emulated-bridge pairing only: reads the certificate of
-/// a bridge that cannot chain to the Hue roots and returns its bridge ID and leaf SHA-256.
-/// The caller shows the pin to the user, and every later request must match it exactly.
-pub fn emulated_bridge_identity(bridge_ip: &str) -> Result<(String, String)> {
-    emulated_bridge_identity_on(bridge_ip, HTTPS_PORT)
+/// The certificate an emulated bridge presented at pairing.
+#[derive(Debug)]
+pub struct EmulatedIdentity {
+    pub certificate_sha256: String,
+    /// The certificate chains to the official Hue roots: a real Philips bridge stands behind
+    /// the address, and real-bridge mode is the right choice for it.
+    pub signed_by_hue_roots: bool,
 }
 
-fn emulated_bridge_identity_on(bridge_ip: &str, port: u16) -> Result<(String, String)> {
+/// Emulated pairing sends the stream to the address the user typed, with no CA behind it, so
+/// only a LAN address is accepted: private (RFC 1918) or link-local IPv4. Every pairing entry
+/// point (CLI, dashboard, `pair_hue.py`) reaches this check through `pair_bridge`.
+pub fn emulated_bridge_address(bridge_ip: &str) -> Result<IpAddr> {
+    match bridge_ip.trim().parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) if ip.is_private() || ip.is_link_local() => Ok(IpAddr::V4(ip)),
+        Ok(_) => bail!(
+            "Emulated Hue Bridge IP must be a private IPv4 address (10.x, 172.16-31.x, 192.168.x or 169.254.x)"
+        ),
+        Err(_) => bail!("Hue Bridge address must be an IP literal"),
+    }
+}
+
+/// Trust on first use, for an explicit emulated-bridge pairing only: reads the certificate of
+/// a bridge that cannot chain to the Hue roots and returns its leaf SHA-256. The bridge ID
+/// comes from the first pinned request, which also checks it.
+/// The caller shows the pin to the user, and every later request must match it exactly.
+pub fn emulated_bridge_identity(bridge_ip: &str) -> Result<EmulatedIdentity> {
+    let ip = emulated_bridge_address(bridge_ip)?;
+    emulated_bridge_identity_on(&ip.to_string(), HTTPS_PORT)
+}
+
+fn emulated_bridge_identity_on(bridge_ip: &str, port: u16) -> Result<EmulatedIdentity> {
     let ip: IpAddr = bridge_ip
         .parse()
         .context("Hue Bridge address must be an IP literal")?;
@@ -66,7 +91,30 @@ fn emulated_bridge_identity_on(bridge_ip: &str, port: u16) -> Result<(String, St
     let tcp = TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(5))
         .context("Failed to connect to the emulated Hue Bridge HTTPS endpoint")?;
     let stream = handshake(bridge_ip, tcp, BridgeKind::Emulated)?;
-    Ok((peer_bridge_id(&stream)?, peer_certificate_sha256(&stream)?))
+    Ok(EmulatedIdentity {
+        certificate_sha256: peer_certificate_sha256(&stream)?,
+        signed_by_hue_roots: peer_signed_by_hue_roots(&stream)?,
+    })
+}
+
+/// Checks the peer certificate, with the chain the peer sent, against the embedded Hue roots.
+/// Only informs the user: the emulated handshake never uses this as trust.
+fn peer_signed_by_hue_roots(stream: &SslStream<TcpStream>) -> Result<bool> {
+    let leaf = stream
+        .ssl()
+        .peer_certificate()
+        .ok_or_else(|| anyhow!("Hue Bridge did not present a TLS certificate"))?;
+    let mut chain = Stack::new()?;
+    for certificate in stream.ssl().peer_cert_chain().into_iter().flatten() {
+        chain.push(certificate.to_owned())?;
+    }
+    let roots = bridge_roots()?;
+    chains_to(&roots, &leaf, &chain)
+}
+
+fn chains_to(roots: &X509StoreRef, leaf: &X509Ref, chain: &StackRef<X509>) -> Result<bool> {
+    let mut context = X509StoreContext::new()?;
+    Ok(context.init(roots, leaf, chain, |context| context.verify_cert())?)
 }
 
 fn connect_bridge_tls_on(
@@ -296,10 +344,11 @@ mod tests {
         let id = "001788fffe000001";
         let identity = self_signed(id);
         let (port, server) = serve_once(&identity);
-        let (seen_id, pin) = emulated_bridge_identity_on("127.0.0.1", port).unwrap();
+        let seen = emulated_bridge_identity_on("127.0.0.1", port).unwrap();
         server.join().unwrap();
-        assert_eq!(seen_id, id);
-        assert_eq!(pin, sha256_hex(&identity.0));
+        assert_eq!(seen.certificate_sha256, sha256_hex(&identity.0));
+        assert!(!seen.signed_by_hue_roots);
+        let pin = seen.certificate_sha256;
 
         let pinned = BridgeTrust {
             bridge_id: Some(id),
@@ -353,23 +402,120 @@ mod tests {
             "{error:#}"
         );
 
-        // No pin: refused before any connection, even with a saved bridge ID.
+        // No pin or a malformed pin: refused before any connection, even with a saved bridge
+        // ID. The address is not an IP literal, so without the early pin check the call would
+        // fail on the address instead, and it can never reach the network or rediscovery.
         let unpinned = BridgeTrust {
             bridge_id: Some(id),
             certificate_sha256: None,
             kind: BridgeKind::Emulated,
         };
         assert!(!unpinned.known());
-        let error = connect_bridge_tls_on("127.0.0.1", 9, unpinned).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("no certificate pin"),
-            "{error:#}"
-        );
-        let malformed = BridgeTrust {
-            certificate_sha256: Some("not-a-sha256"),
-            ..unpinned
+        for pin in [None, Some("not-a-sha256"), Some(&pin[1..])] {
+            let trust = BridgeTrust {
+                certificate_sha256: pin,
+                ..unpinned
+            };
+            let error = connect_bridge_tls_on("pin-check-runs-first", 9, trust).unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                "Emulated Hue Bridge has no certificate pin; pair it again as an emulated bridge"
+            );
+        }
+    }
+
+    #[test]
+    fn emulated_pairing_accepts_only_private_or_link_local_ipv4() {
+        for ip in [
+            "10.0.0.5",
+            "172.16.1.2",
+            "172.31.255.1",
+            " 192.168.1.20 ",
+            "169.254.3.4",
+        ] {
+            assert_eq!(emulated_bridge_address(ip).unwrap().to_string(), ip.trim());
+        }
+        for ip in [
+            "8.8.8.8",
+            "192.0.2.10",
+            "172.32.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "fe80::1",
+            "fd00::1",
+            "::1",
+        ] {
+            let error = emulated_bridge_address(ip).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("must be a private IPv4 address"),
+                "{ip}: {error:#}"
+            );
+        }
+        assert!(emulated_bridge_address("bifrost.local").is_err());
+        // The public pairing entry point refuses before it opens any connection.
+        let error = emulated_bridge_identity("8.8.8.8").unwrap_err();
+        assert!(format!("{error:#}").contains("must be a private IPv4 address"));
+    }
+
+    #[test]
+    fn philips_signed_certificates_are_told_apart_from_self_signed_ones() {
+        // A test CA stands in for the Hue roots: no test can hold a Philips-signed key.
+        let key = || {
+            let group = openssl::ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+            PKey::from_ec_key(openssl::ec::EcKey::generate(&group).unwrap()).unwrap()
         };
-        assert!(connect_bridge_tls_on("127.0.0.1", 9, malformed).is_err());
+        let ca_key = key();
+        let mut ca_name = openssl::x509::X509Name::builder().unwrap();
+        ca_name
+            .append_entry_by_nid(Nid::COMMONNAME, "test-hue-root")
+            .unwrap();
+        let ca_name = ca_name.build();
+        let mut ca = X509::builder().unwrap();
+        ca.set_version(2).unwrap();
+        ca.set_subject_name(&ca_name).unwrap();
+        ca.set_issuer_name(&ca_name).unwrap();
+        ca.set_pubkey(&ca_key).unwrap();
+        ca.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        ca.set_not_after(&openssl::asn1::Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        ca.append_extension(
+            openssl::x509::extension::BasicConstraints::new()
+                .critical()
+                .ca()
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        ca.sign(&ca_key, MessageDigest::sha256()).unwrap();
+        let ca = ca.build();
+        let leaf_key = key();
+        let mut name = openssl::x509::X509Name::builder().unwrap();
+        name.append_entry_by_nid(Nid::COMMONNAME, "001788fffe000001")
+            .unwrap();
+        let mut leaf = X509::builder().unwrap();
+        leaf.set_version(2).unwrap();
+        leaf.set_subject_name(&name.build()).unwrap();
+        leaf.set_issuer_name(ca.subject_name()).unwrap();
+        leaf.set_pubkey(&leaf_key).unwrap();
+        leaf.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        leaf.set_not_after(&openssl::asn1::Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        leaf.sign(&ca_key, MessageDigest::sha256()).unwrap();
+        let leaf = leaf.build();
+
+        let mut roots = X509StoreBuilder::new().unwrap();
+        roots.add_cert(ca).unwrap();
+        let roots = roots.build();
+        let empty = Stack::new().unwrap();
+        assert!(chains_to(&roots, &leaf, &empty).unwrap());
+        let (emulator, _) = self_signed("001788fffe000001");
+        assert!(!chains_to(&roots, &emulator, &empty).unwrap());
+        assert!(!chains_to(&bridge_roots().unwrap(), &leaf, &empty).unwrap());
     }
 
     #[test]
