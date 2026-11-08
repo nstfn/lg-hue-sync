@@ -1,126 +1,95 @@
-# lg-hue-sync
+# lg-hue-sync (nstfn)
 
-[![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![CI](https://github.com/adeze/lg-hue-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/adeze/lg-hue-sync/actions/workflows/ci.yml)
-[![webOS](https://img.shields.io/badge/webOS-rooted%205%2F6-blue.svg)](https://www.webosbrew.org/)
+[![CI](https://github.com/nstfn/lg-hue-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/nstfn/lg-hue-sync/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Native ambient-light synchronization for rooted LG webOS TVs. A Rust daemon captures the displayed image, derives spatial colours, and streams them to Philips Hue Entertainment and Nanoleaf 4D. A responsive LAN dashboard provides pairing, calibration, presets, and independent output controls.
+Ambient light for one TV: a rooted LG OLED G4 (webOS 11) drives a Philips Hue Play gradient
+lightstrip (LCX002, 7 segments) behind it. There is no Hue Bridge: the lights go through
+[Bifrost (nstfn)](https://github.com/nstfn/bifrost), a Hue bridge emulator on Zigbee2MQTT.
 
-## Features
+This is a fork of [adeze/lg-hue-sync](https://github.com/adeze/lg-hue-sync). It is tuned for this
+TV and its owner's preferences, and it no longer follows upstream. Thanks to adeze for the daemon,
+the capture code and the dashboard this work starts from.
 
-- Root-only webOS capture through the dynamically loaded `libvtcapture` API.
-- Hue Entertainment API v2 over DTLS 1.2 PSK, including gradient member identity.
-- Nanoleaf 4D UDP streaming with 40-panel corner, direction, and offset alignment.
-- Independent Hue/Nanoleaf controls; TV sleep/wake following can be automatic or manual.
-- Letterbox-aware sampling, an optional legacy midtone lift, OLED black gating, smoothing, and bounded scene changes.
-- Responsive dashboard at `http://<tv-ip>:8088/` with system, dark, and light themes.
+## What it does
 
-## Limits and safety
+A Rust daemon on the TV captures the HDMI picture (320 x 180, 30 frames/s). It computes one
+colour per strip segment from the part of the picture edge behind that segment, smooths it, and
+streams it over Hue Entertainment (DTLS) to Bifrost. A dashboard at `http://<tv-ip>:8088/`
+changes every setting live.
 
-- Root access is required. Rooting can void warranties or render a TV unusable; confirm model and firmware compatibility first.
-- Capture is HDMI-only: known built-in apps and Home automatically pause capture; returning to HDMI resumes it unless manually stopped. This input policy does not detect or bypass DRM. External HDMI playback is the supported path for protected content.
-- Hue decides how physical gradient segments are grouped into Entertainment channels. This project streams the selected area's returned channels; it does not fabricate more.
-- LG private capture APIs and community root methods are unsupported by LG and may change with firmware.
+## How this fork diverges
 
-Check [cani.rootmy.tv](https://cani.rootmy.tv/) and [webOS Brew](https://github.com/webosbrew) before changing a TV.
+Upstream base: `5ea246e`. This fork adds 42 commits of its own.
 
-## Requirements
+- **Bridge emulator.** An opt-in emulated-bridge mode pairs with Bifrost: the self-signed
+  certificate is pinned at pairing, pairing accepts LAN addresses only, a real Philips
+  certificate raises a warning, and the stream ends with a DTLS `close_notify`
+  (`92ce81c`, `020294d`, `3222edf`).
+- **Edge sampling.** Each gradient segment reads the picture edge behind it, like Ambilight:
+  Gaussian weights along the edge, exponential decay inward, weights precomputed per frame size
+  (`1c69f9f`). Edge width and depth are live settings (`4f065bd`).
+- **Fast edge changes.** Upstream detects a scene cut from the picture centre only. Here, a
+  large colour change on one edge also jumps at once for that segment, then the normal ramp
+  lands it softly (`4f065bd`, setting `edge_cut_detection`).
+- **Colour pipeline.** The hue survives the output trim, the noise gate, the step limit and the
+  spatial blend; rise and fall smoothing survive Hue events (`03da27c`, `f7c9cad`).
+- **TV power.** The lights follow TV standby and power-off: our stream stops first, then a
+  second pass turns the lights off. The TV power state is polled once per round, off the frame
+  loop (`0e215b9`, `0acc717`, `300c746`, `2d5892b`).
+- **Capture recovery.** Capture restarts after an HDMI renegotiation instead of pausing
+  (`f0c10c9`).
+- **Hardened install on the G4.** Confined systemd unit, least-privilege Luna rights, optional
+  watchdog, bounded HTTP API and config writes, no `DILE_VT` (`89cd056`, `68569ce`, `56526dc`,
+  `199a17b`, `fac1cfa`, `579175c`). See [deploy/webos11/README.md](deploy/webos11/README.md).
+- **CI.** Runs on every branch push and keeps the ARMv7 binary as an artifact (`960f1fd`,
+  `0dc664d`).
 
-- Development Mac with Rust/rustup, [cargo-nextest](https://nexte.st/docs/installation/pre-built-binaries/), webOS Brew native SDK, `make`, SSH, and `uv`. Docker is needed for one-time sysroot setup or the explicit fallback.
-- Rooted webOS TV with root SSH and compatible capture libraries.
-- Hue Bridge v2 and/or Nanoleaf 4D on the same LAN.
+Upstream commits after `5ea246e` that this fork does not take:
 
-## Validate and build
+- `aae6ba8` (Hue streaming, dashboard controls, Luna subscriptions for the TV state). Its TV
+  state source conflicts with our polling observer, which drives the lights-off at standby.
+- `6af96e7` (opt-in NV12 screen streaming and its viewer) and `f6099d8` (mime update).
+
+## Build
 
 ```bash
 cargo fmt --all -- --check
 cargo nextest run --locked
 cargo clippy --bin lg-hue-sync -- -D warnings
-make build
-file target/armv7-unknown-linux-gnueabi/release/lg-hue-sync
+bun install --cwd frontend --frozen-lockfile && make dashboard-check   # bun 1.4.4, as in CI
 ```
 
-The default target build uses the Mac webOS SDK compiler with a Buster sysroot to stay within the LG C1/webOS 6 glibc ceiling. It produces an ARM Linux binary; ordinary host Cargo builds produce Mac binaries for tests.
+The ARMv7 binary for the TV comes from CI (artifact `webos-armv7-release`, with
+`SHA256SUMS`), or locally from `make build` (webOS native SDK) or `make build-docker`.
 
-Run `make native-setup` once using the installed [webosbrew/native-toolchain](https://github.com/webosbrew/native-toolchain) and cached builder, then `make build` without Docker. `make build-docker` remains the explicit fallback and Linux CI path. Rust Ares powers `make package-app` and explicit-device launcher management. See [docs/operations.md](docs/operations.md) for setup, ABI gates and deployment boundaries.
+Build `src/web/ui.html` on Linux, as CI does. A macOS build differs in Vite's module preload
+helper and fails the CI step "Verify embedded dashboard matches sources".
 
-Apple Shortcuts can apply a dashboard preset over the trusted LAN with a `POST` request to `http://<tv-ip>:8088/api/presets/<name>`; see [docs/operations.md](docs/operations.md#apple-shortcuts-and-presets). Preset changes are live until saved. The generated OpenAPI description for all HTTP API routes is available at `http://<tv-ip>:8088/openapi.json`; see [API discovery](docs/operations.md#http-api-description).
+## Deploy
 
-## Install and update
-
-The dashboard includes a web app manifest and QSync icons. In **Devices → QSync app**, find installation guidance or an install button when supported. On iPhone/iPad, use Safari **Share → Add to Home Screen**; on Mac, **File → Add to Dock**. Automatic PWA install prompts require HTTPS (or localhost during development); the TV's plain HTTP LAN address may only support manual installation or a shortcut, depending on the browser. The app requires a reachable TV and does not cache controls or frames offline. No service worker or additional TV process is installed.
-
-First installation, after root SSH already works:
+Upload the binary to the TV as `/var/home/root/lg-hue-sync/lg-hue-sync.new`, then swap it:
 
 ```bash
-./scripts/deploy.sh <tv-ip>
+ssh root@<tv-ip> "SHA=<sha256 of the binary> sh -s" < scripts/swap_binary.sh
 ```
 
-Existing installation, preserving paired credentials and layout:
+The swap checks the SHA-256, keeps the running binary as `lg-hue-sync.previous`, and restores
+it if the new one fails to start. `make deploy-bin TV_IP=<tv-ip>` does the same from a local
+build and keeps the least-privilege Luna role.
 
-```bash
-make deploy-bin TV_IP=<tv-ip>
-```
+The runtime configuration is `/var/home/root/lg-hue-sync/state/config.json` on the TV. It holds
+pairing secrets: never commit it or copy it to another TV.
 
-Then open `http://<tv-ip>:8088/`, pair devices, choose a Hue Entertainment Area, and save settings. Never copy a populated `config.json` between users or commit it.
+More: [docs/operations.md](docs/operations.md), [docs/architecture.md](docs/architecture.md),
+[CHANGELOG.md](CHANGELOG.md).
 
-Build, rollback, uninstall, and verification details: [docs/operations.md](docs/operations.md).
+## Limits
 
-## Development commands
-
-```bash
-cargo run -- pair --bridge <bridge-ip> --output config.json
-cargo run -- pair-nanoleaf --ip <controller-ip> --config config.json
-cargo run -- sync-hue --config config.json
-cargo run -- test-pattern --config config.json
-cargo run -- test-nanoleaf --config config.json
-cargo run -- run --config config.json
-```
-
-Pairing and patterns affect physical devices. Use them only when the owner expects light output.
-
-`uv run scripts/pair_hue.py --bridge-ip <bridge-ip> --output-config config.json`
-remains a deprecated compatibility wrapper for Rust HTTPS pairing. It builds for
-the Rust compiler's host target, preserves the existing argument names, and no
-longer accepts `--tv-ip` or configures Hyperion directly.
-
-For screen-to-light mapping checks, display the [4K calibration images or selectable browser patches](calibration-patterns/README.md) through the viewing HDMI source. Unlike the dashboard's direct light tests, these exercise capture and video-derived sampling.
-
-## Configuration
-
-Start from [config.example.json](config.example.json), or pair through the dashboard. Runtime configuration contains secrets and stays untracked. On the TV:
-
-```text
-/var/home/root/lg-hue-sync/config.json
-```
-
-Hue HTTPS validates the two official Hue root CAs and the saved Bridge ID. A bridge emulator such as Bifrost pairs only through the explicit `pair --bridge <bridge-ip> --emulated-bridge` option (or the dashboard's **Emulated bridge** switch), which pins its self-signed certificate on first use; see [operations](docs/operations.md#emulated-bridge-opt-in). Existing certificate pins bootstrap that identity only on an exact match; subsequent signed certificate renewal retains the identity check. Pairing never falls back to HTTP. Status endpoints never return Hue or Nanoleaf secrets.
-
-## Project layout
-
-```text
-src/                 daemon, capture, colour, Hue, Nanoleaf, dashboard
-webos-app/           optional launcher/dashboard package
-scripts/             build, provisioning, deployment, maintenance
-docs/                architecture, operations, release runbooks
-.agents/skills/      repository-specific agent workflow
-```
-
-Useful implementation references:
-
-- [webosbrew/native-toolchain](https://github.com/webosbrew/native-toolchain) — webOS sysroot/toolchain reference.
-- [openlgtv/buildroot-nc4](https://github.com/openlgtv/buildroot-nc4) — Buildroot source behind the community SDK, not a drop-in Rust linker fix.
-- [webosbrew/webos-userland](https://github.com/webosbrew/webos-userland/tree/main) and its [API reference](https://www.webosbrew.org/webos-userland/index.html) — community stub headers and libraries for native LG userland APIs; validate symbols and behavior on the target firmware.
-- [webosbrew/hyperhdr-webos-loader](https://github.com/webosbrew/hyperhdr-webos-loader) — app/service packaging and lifecycle reference.
-- [webosbrew/ares-cli-rs](https://github.com/webosbrew/ares-cli-rs) — packaging, install, shell, and transfer tooling.
-- [HyperHDR](https://github.com/awawa-dev/HyperHDR) — reference for colour precision, temporal smoothing, source calibration, and stage metrics; adapt only after measuring this TV's pipeline.
-- [webosbrew/apps-repo](https://github.com/webosbrew/apps-repo) — Homebrew Channel submission format.
-
-## Contributing
-
-This is currently a single-maintainer project. Changes go directly to `main`; no pull request is required unless the maintainer explicitly asks for one. Run the validation commands before pushing.
+- The TV must be rooted. Rooting can void the warranty or break the TV.
+- Capture is HDMI-only. It does not detect or bypass DRM.
+- LG's capture APIs are private and may change with a firmware update.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE), as upstream.
