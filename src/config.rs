@@ -1593,6 +1593,53 @@ mod tests {
     }
 
     #[test]
+    fn vertical_offset_moves_side_bands_and_keeps_them_on_the_picture() {
+        fn close(a: [f32; 4], b: [f32; 4]) -> bool {
+            a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)
+        }
+        let still = EdgeGeometry::default();
+        let raised = still.with_vertical_offset(15.0, SCREEN_HEIGHT_CM);
+        let shift = 15.0 / SCREEN_HEIGHT_CM;
+        assert!((raised.vertical_offset - shift).abs() < 1e-6);
+        // A side point moves up by the offset; 3 sigma (0.24) on each side of the new centre.
+        let side = edge_band((0.0, 0.5), raised);
+        let expected = [0.0, 0.18, 0.26 - shift, 0.74 - shift];
+        assert!(close(side, expected), "{side:?}");
+        // The bottom corner moves up and stays clamped to the picture.
+        let bottom = edge_band((1.0, 1.0), raised);
+        let expected = [0.82, 1.0, 0.76 - shift, 1.0];
+        assert!(close(bottom, expected), "{bottom:?}");
+        // A top corner cannot rise above the picture; a top-only point never moves.
+        let top_corner = edge_band((0.0, 0.0), still);
+        assert!(close(edge_band((0.0, 0.0), raised), top_corner));
+        let top_middle = edge_band((0.5, 0.0), still);
+        assert!(close(edge_band((0.5, 0.0), raised), top_middle));
+        // A lowered strip moves the side point down; the bottom corner cannot sink below.
+        let lowered = still.with_vertical_offset(-15.0, SCREEN_HEIGHT_CM);
+        let low_side = edge_band((0.0, 0.5), lowered);
+        let expected = [0.0, 0.18, 0.26 + shift, 0.74 + shift];
+        assert!(close(low_side, expected), "{low_side:?}");
+        let bottom_corner = edge_band((0.0, 1.0), still);
+        assert!(close(edge_band((0.0, 1.0), lowered), bottom_corner));
+        // Bad input: the offset clamps to 30 cm, NaN means none, a bad height means 80.9 cm.
+        let clamped = still.with_vertical_offset(99.0, SCREEN_HEIGHT_CM);
+        assert!((clamped.vertical_offset - 30.0 / SCREEN_HEIGHT_CM).abs() < 1e-6);
+        let none = still.with_vertical_offset(f32::NAN, SCREEN_HEIGHT_CM);
+        assert_eq!(none.vertical_offset, 0.0);
+        let bad_height = still.with_vertical_offset(10.0, 0.0);
+        assert!((bad_height.vertical_offset - 10.0 / SCREEN_HEIGHT_CM).abs() < 1e-6);
+        // An older config without the fields loads with no offset and the 65-inch height.
+        let mut json = serde_json::to_value(Config::new_default("", "", "", "")).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("edge_vertical_offset_cm");
+        fields.remove("screen_height_cm");
+        let restored: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.edge_vertical_offset_cm, 0.0);
+        assert_eq!(restored.screen_height_cm, SCREEN_HEIGHT_CM);
+        assert_eq!(restored.edge_geometry().vertical_offset, 0.0);
+    }
+
+    #[test]
     fn test_3d_height_mapping() {
         // Ceiling light (Z = 1.0): maps to top of screen (Y near 0.0)
         let ceiling = LightZone::from_3d_position(2, "Top Atmos", [0.0, 0.5, 1.0]);

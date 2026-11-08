@@ -1984,6 +1984,48 @@ mod tests {
         }
     }
 
+    /// Red (255, 0, 0) on the upper half, blue (0, 0, 255) on the lower half.
+    fn red_top_blue_bottom() -> Vec<u8> {
+        let mut pixels = vec![255u8; BORDER_WIDTH * BORDER_HEIGHT * 4];
+        for y in 0..BORDER_HEIGHT {
+            let rgb = if y < BORDER_HEIGHT / 2 {
+                [255, 0, 0]
+            } else {
+                [0, 0, 255]
+            };
+            for x in 0..BORDER_WIDTH {
+                pixels[(y * BORDER_WIDTH + x) * 4..][..3].copy_from_slice(&rgb);
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn vertical_offset_moves_what_a_side_segment_reads() {
+        use crate::config::SCREEN_HEIGHT_CM;
+        let sample = |offset_cm: f32| {
+            let mut sampler = instant_sampler(vec![gradient_segment(0, [-0.8, 0.0, 0.0])]);
+            let geometry = EdgeGeometry::default();
+            sampler.set_edge_geometry(geometry.with_vertical_offset(offset_cm, SCREEN_HEIGHT_CM));
+            let (colors, _) = sampler.sample_frame_precise(
+                &red_top_blue_bottom(),
+                BORDER_WIDTH as u32,
+                BORDER_HEIGHT as u32,
+                false,
+            );
+            colors[0].1
+        };
+        // The middle-left segment sits on the red/blue line: it mixes both.
+        let level = sample(0.0);
+        assert!(level.r > 60.0 && level.b > 60.0, "{level:?}");
+        // +15 cm moves its centre 18.5 % up, 2.3 sigma above the line: red wins.
+        let raised = sample(15.0);
+        assert!(raised.r - raised.b > 150.0, "{raised:?}");
+        // -15 cm moves it as far down: blue wins.
+        let lowered = sample(-15.0);
+        assert!(lowered.b - lowered.r > 150.0, "{lowered:?}");
+    }
+
     #[test]
     fn room_lamp_on_the_picture_centre_still_sees_the_red_centre() {
         let mut lamp = LightZone::from_3d_position(5, "Lamp", [0.0, 0.0, 0.0]);
