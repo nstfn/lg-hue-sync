@@ -77,6 +77,10 @@ pub struct LiveSettings {
     #[serde(default = "crate::config::default_edge_depth")]
     #[schema(minimum = 0.03, maximum = 0.1, default = 0.06)]
     pub edge_depth: f32,
+    /// Gradient-strip side bands: upward shift in cm, to match where the strip sits.
+    #[serde(default)]
+    #[schema(minimum = -30, maximum = 30, default = 0)]
+    pub edge_vertical_offset_cm: f32,
     /// A large colour change on one gradient-strip segment jumps instead of ramping.
     #[serde(default)]
     #[schema(default = false)]
@@ -137,7 +141,10 @@ fn default_smoothing_factor() -> f32 {
 
 impl LiveSettings {
     fn validate(&self) -> Result<(), ApiError> {
-        use crate::config::{EDGE_CUT_THRESHOLD_RANGE, EDGE_DEPTH_RANGE, EDGE_SIGMA_ALONG_RANGE};
+        use crate::config::{
+            EDGE_CUT_THRESHOLD_RANGE, EDGE_DEPTH_RANGE, EDGE_SIGMA_ALONG_RANGE,
+            EDGE_VERTICAL_OFFSET_CM_RANGE,
+        };
         let ranges = [
             (
                 "brightness_multiplier",
@@ -172,6 +179,12 @@ impl LiveSettings {
                 self.edge_depth,
                 EDGE_DEPTH_RANGE.0,
                 EDGE_DEPTH_RANGE.1,
+            ),
+            (
+                "edge_vertical_offset_cm",
+                self.edge_vertical_offset_cm,
+                EDGE_VERTICAL_OFFSET_CM_RANGE.0,
+                EDGE_VERTICAL_OFFSET_CM_RANGE.1,
             ),
             (
                 "edge_cut_threshold",
@@ -1912,6 +1925,7 @@ mod tests {
             depth_influence: crate::config::default_depth_influence(),
             edge_sigma_along: crate::config::default_edge_sigma_along(),
             edge_depth: crate::config::default_edge_depth(),
+            edge_vertical_offset_cm: 0.0,
             edge_cut_detection: false,
             edge_cut_threshold: crate::config::default_edge_cut_threshold(),
             gamma: 1.0,

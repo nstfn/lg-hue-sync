@@ -760,6 +760,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         depth_influence: config.depth_influence,
         edge_sigma_along: edge_geometry.sigma_along,
         edge_depth: edge_geometry.depth,
+        edge_vertical_offset_cm: config.edge_vertical_offset_cm.clamp(
+            config::EDGE_VERTICAL_OFFSET_CM_RANGE.0,
+            config::EDGE_VERTICAL_OFFSET_CM_RANGE.1,
+        ),
         edge_cut_detection: config.edge_cut_detection,
         edge_cut_threshold: config.edge_cut_threshold.clamp(
             config::EDGE_CUT_THRESHOLD_RANGE.0,
@@ -1283,6 +1287,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             config.depth_influence = live_st.depth_influence;
             config.edge_sigma_along = live_st.edge_sigma_along;
             config.edge_depth = live_st.edge_depth;
+            config.edge_vertical_offset_cm = live_st.edge_vertical_offset_cm;
             let edge_geometry = config.edge_geometry();
             for zone in &mut config.zones {
                 zone.set_footprint(live_st.depth_influence, edge_geometry);
@@ -1409,6 +1414,7 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 save_cfg.depth_influence = live_st.depth_influence;
                 save_cfg.edge_sigma_along = live_st.edge_sigma_along;
                 save_cfg.edge_depth = live_st.edge_depth;
+                save_cfg.edge_vertical_offset_cm = live_st.edge_vertical_offset_cm;
                 save_cfg.edge_cut_detection = live_st.edge_cut_detection;
                 save_cfg.edge_cut_threshold = live_st.edge_cut_threshold;
                 save_cfg.gamma = live_st.gamma;
@@ -1497,7 +1503,11 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     let live_st = shared_state.current_settings.read().unwrap().clone();
                     config.zones = area.zones;
                     let edge_geometry =
-                        config::EdgeGeometry::new(live_st.edge_sigma_along, live_st.edge_depth);
+                        config::EdgeGeometry::new(live_st.edge_sigma_along, live_st.edge_depth)
+                            .with_vertical_offset(
+                                live_st.edge_vertical_offset_cm,
+                                config.screen_height_cm,
+                            );
                     for zone in &mut config.zones {
                         zone.set_footprint(live_st.depth_influence, edge_geometry);
                     }

@@ -183,6 +183,17 @@ pub fn default_edge_cut_threshold() -> f32 {
 pub const EDGE_SIGMA_ALONG_RANGE: (f32, f32) = (0.03, 0.12);
 pub const EDGE_DEPTH_RANGE: (f32, f32) = (0.03, 0.10);
 pub const EDGE_CUT_THRESHOLD_RANGE: (f32, f32) = (0.1, 1.0);
+/// Vertical strip offset, in cm: positive when the strip sits higher than the picture edge points.
+pub const EDGE_VERTICAL_OFFSET_CM_RANGE: (f32, f32) = (-30.0, 30.0);
+
+/// Picture height of a 65-inch 16:9 panel, in cm: converts the vertical offset into a fraction.
+pub const SCREEN_HEIGHT_CM: f32 = 80.9;
+/// Below this height a configured screen height is a typo: the default applies.
+const MIN_SCREEN_HEIGHT_CM: f32 = 10.0;
+
+pub fn default_screen_height_cm() -> f32 {
+    SCREEN_HEIGHT_CM
+}
 
 /// Shape of the edge band that a gradient-strip segment reads, as fractions of the active side.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,6 +202,10 @@ pub struct EdgeGeometry {
     pub sigma_along: f32,
     /// Inward decay length: weight exp(-d / depth), 0 past 3 depths.
     pub depth: f32,
+    /// Upward shift of the left and right bands, as a fraction of the active picture height.
+    /// The strip behind the TV may start above the bottom of the picture: the light of a side
+    /// segment then lands higher on the wall than the picture point it reads.
+    pub vertical_offset: f32,
 }
 
 impl EdgeGeometry {
@@ -206,7 +221,35 @@ impl EdgeGeometry {
         Self {
             sigma_along: bounded(sigma_along, EDGE_SIGMA_ALONG_RANGE, EDGE_SIGMA_ALONG),
             depth: bounded(depth, EDGE_DEPTH_RANGE, EDGE_DEPTH),
+            vertical_offset: 0.0,
         }
+    }
+
+    /// Shifts the side bands up by `offset_cm` on a picture `screen_height_cm` tall. The offset
+    /// clamps to its range; a non-finite offset means none, an implausible height the default.
+    /// The fraction applies to the active picture: a letterboxed film shifts slightly more.
+    pub fn with_vertical_offset(self, offset_cm: f32, screen_height_cm: f32) -> Self {
+        let (min, max) = EDGE_VERTICAL_OFFSET_CM_RANGE;
+        let offset_cm = if offset_cm.is_finite() {
+            offset_cm.clamp(min, max)
+        } else {
+            0.0
+        };
+        let height = if screen_height_cm.is_finite() && screen_height_cm >= MIN_SCREEN_HEIGHT_CM {
+            screen_height_cm
+        } else {
+            SCREEN_HEIGHT_CM
+        };
+        Self {
+            vertical_offset: offset_cm / height,
+            ..self
+        }
+    }
+
+    /// Along-edge centre of a left or right band for an edge point at height `v`: moved up by the
+    /// offset, and kept on the picture so that a band never leaves it.
+    pub(crate) fn side_center(&self, v: f32) -> f32 {
+        (v - self.vertical_offset).clamp(0.0, 1.0)
     }
 }
 
@@ -215,6 +258,7 @@ impl Default for EdgeGeometry {
         Self {
             sigma_along: EDGE_SIGMA_ALONG,
             depth: EDGE_DEPTH,
+            vertical_offset: 0.0,
         }
     }
 }
@@ -286,7 +330,8 @@ pub(crate) fn edge_band(point: (f32, f32), edge: EdgeGeometry) -> [f32; 4] {
         } else {
             (1.0 - deep, 1.0)
         };
-        include(x_min, x_max, point.1 - along, point.1 + along);
+        let center = edge.side_center(point.1);
+        include(x_min, x_max, center - along, center + along);
     }
     if top {
         include(point.0 - along, point.0 + along, 0.0, deep);
@@ -471,6 +516,12 @@ pub struct Config {
     /// Normalised RGB distance above which a segment jumps, when edge cut detection is on.
     #[serde(default = "default_edge_cut_threshold")]
     pub edge_cut_threshold: f32,
+    /// Gradient-strip side bands: upward shift in cm, to match where the strip sits.
+    #[serde(default)]
+    pub edge_vertical_offset_cm: f32,
+    /// Picture height in cm, for the vertical offset; default: a 65-inch 16:9 panel.
+    #[serde(default = "default_screen_height_cm")]
+    pub screen_height_cm: f32,
     #[serde(default = "default_gamma")]
     pub gamma: f32,
     #[serde(default = "default_noise_gate")]
@@ -622,6 +673,7 @@ fn default_zones() -> Vec<LightZone> {
 impl Config {
     pub fn edge_geometry(&self) -> EdgeGeometry {
         EdgeGeometry::new(self.edge_sigma_along, self.edge_depth)
+            .with_vertical_offset(self.edge_vertical_offset_cm, self.screen_height_cm)
     }
 
     pub fn apply_hue_pairing(&mut self, bridge_ip: String, paired: crate::hue::PairedBridge) {
@@ -713,6 +765,8 @@ impl Config {
             edge_depth: default_edge_depth(),
             edge_cut_detection: false,
             edge_cut_threshold: default_edge_cut_threshold(),
+            edge_vertical_offset_cm: 0.0,
+            screen_height_cm: default_screen_height_cm(),
             gamma: default_gamma(),
             noise_gate_threshold: 0.02,
             smoothing_factor: 0.35,

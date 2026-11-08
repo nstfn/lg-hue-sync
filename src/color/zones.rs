@@ -644,6 +644,13 @@ fn build_zone_weights(
 
     let (edge_x, edge_y) = edge.unwrap_or_default();
     let (side, top) = edge.map(crate::config::edge_sides).unwrap_or((None, false));
+    // Rows carry the Gaussian along a left or right edge: the vertical offset moves its centre.
+    // On a top-only point the rows only carry the top decay, so the offset changes nothing.
+    let along_y = if side.is_some() {
+        edge_geometry.side_center(edge_y)
+    } else {
+        edge_y
+    };
     let columns = (x_start..x_end)
         .step_by(2)
         .map(|x| {
@@ -665,7 +672,7 @@ fn build_zone_weights(
                 Footprint::Uniform => AxisWeight::default(),
                 Footprint::Room => AxisWeight::room(ny - center_y, half_y),
                 Footprint::Edge => {
-                    AxisWeight::edge(ny - edge_y, top.then_some(ny.abs()), edge_geometry)
+                    AxisWeight::edge(ny - along_y, top.then_some(ny.abs()), edge_geometry)
                 }
             }
         })

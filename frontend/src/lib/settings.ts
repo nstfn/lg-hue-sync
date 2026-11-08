@@ -8,6 +8,7 @@ export interface LiveSettings {
   depth_influence: number;
   edge_sigma_along: number;
   edge_depth: number;
+  edge_vertical_offset_cm: number;
   edge_cut_detection: boolean;
   edge_cut_threshold: number;
   gamma: number;
@@ -41,6 +42,7 @@ export const initialSettings: LiveSettings = {
   depth_influence: 0.5,
   edge_sigma_along: 0.08,
   edge_depth: 0.06,
+  edge_vertical_offset_cm: 0,
   edge_cut_detection: false,
   edge_cut_threshold: 0.35,
   gamma: 1,
@@ -76,7 +78,8 @@ export type NumericKey =
   | 'hue_output_brightness'
   | 'nanoleaf_output_brightness'
   | 'edge_sigma_along'
-  | 'edge_depth';
+  | 'edge_depth'
+  | 'edge_vertical_offset_cm';
 export const faders: {
   key: NumericKey;
   label: string;
@@ -153,6 +156,13 @@ export const faders: {
     stops: [0.03, 0.04, 0.05, 0.06, 0.08, 0.1],
     format: (v) => `${Math.round(v * 100)}%`,
     help: 'How far into the picture each segment reads. Lower follows the outermost content.',
+  },
+  {
+    key: 'edge_vertical_offset_cm',
+    label: 'Vertical offset',
+    stops: [-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30],
+    format: (v) => `${v > 0 ? '+' : ''}${Math.round(v)} cm`,
+    help: 'Where the strip sits behind the TV. Raise it when the wall light shows colours higher than the picture.',
   },
 ];
 export const colourModes = [
