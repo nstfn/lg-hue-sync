@@ -1,5 +1,5 @@
 use crate::color::gamut::{rgb_to_xy_brightness, HueGamut};
-use crate::config::LightZone;
+use crate::config::{EdgeGeometry, LightZone};
 use palette::{FromColor, Hsv, Mix, Srgb};
 
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,14 @@ impl FloatColor {
             (xy.y * 65535.0).clamp(0.0, 65535.0).round() as u16,
             (xy.brightness * 65535.0).clamp(0.0, 65535.0).round() as u16,
         )
+    }
+
+    /// Same metric as `RgbColor::delta`: Euclidean RGB distance, normalised by 255.
+    pub fn delta(self, other: FloatColor) -> f32 {
+        let dr = (self.r - other.r) / 255.0;
+        let dg = (self.g - other.g) / 255.0;
+        let db = (self.b - other.b) / 255.0;
+        (dr * dr + dg * dg + db * db).sqrt()
     }
 
     pub fn lerp(self, target: FloatColor, alpha: f32) -> Self {
@@ -356,6 +364,15 @@ impl ColorProcessor {
         target
     }
 
+    /// Mean and highlight blend that `process` starts from, before the gate and transforms.
+    fn blend_target(&self, mean: FloatColor, peak: FloatColor, max_luma: f32) -> FloatColor {
+        if self.peak_weight > 0.0 && max_luma > 0.0 {
+            mean.lerp(peak, self.peak_weight)
+        } else {
+            mean
+        }
+    }
+
     pub fn process(
         &self,
         mean: FloatColor,
@@ -367,11 +384,7 @@ impl ColorProcessor {
     ) -> FloatColor {
         // Preserve 30 FPS tuning without treating a capture stall as one giant color jump.
         let elapsed = elapsed.min(Duration::from_millis(100));
-        let mut target = if self.peak_weight > 0.0 && max_luma > 0.0 {
-            mean.lerp(peak, self.peak_weight)
-        } else {
-            mean
-        };
+        let mut target = self.blend_target(mean, peak, max_luma);
         // Require more light to leave black than to remain lit. Uniform black still stops.
         let threshold = self.noise_gate_threshold
             * if current == FloatColor::default() {
@@ -521,15 +534,15 @@ impl AxisWeight {
         }
     }
 
-    fn edge(along: f32, inward: Option<f32>) -> Self {
-        use crate::config::{EDGE_DEPTH, EDGE_SIGMA_ALONG};
-        let gauss = if along.abs() <= 3.0 * EDGE_SIGMA_ALONG {
-            (-along * along / (2.0 * EDGE_SIGMA_ALONG * EDGE_SIGMA_ALONG)).exp()
+    fn edge(along: f32, inward: Option<f32>, edge: EdgeGeometry) -> Self {
+        let sigma = edge.sigma_along;
+        let gauss = if along.abs() <= 3.0 * sigma {
+            (-along * along / (2.0 * sigma * sigma)).exp()
         } else {
             0.0
         };
         let (inward, decay) = match inward {
-            Some(d) if d <= 3.0 * EDGE_DEPTH => (d, (-d / EDGE_DEPTH).exp()),
+            Some(d) if d <= 3.0 * edge.depth => (d, (-d / edge.depth).exp()),
             Some(d) => (d, 0.0),
             None => (f32::INFINITY, 0.0),
         };
@@ -570,8 +583,8 @@ impl ZoneWeights {
     }
 }
 
-/// Zone weights for one frame size and active area. `ZoneSampler::set_depth_influence`
-/// drops the cache, since it is the only change to the zone list.
+/// Zone weights for one frame size and active area. `ZoneSampler::set_depth_influence` and
+/// `ZoneSampler::set_edge_geometry` drop the cache, since they are the only zone changes.
 struct WeightCache {
     width: u32,
     height: u32,
@@ -584,6 +597,7 @@ fn build_zone_weights(
     width: u32,
     height: u32,
     active: ActiveRect,
+    edge_geometry: EdgeGeometry,
 ) -> ZoneWeights {
     let act_x_min = active.x_min;
     let act_x_range = (active.x_max - act_x_min).max(0.1);
@@ -637,7 +651,9 @@ fn build_zone_weights(
             match footprint {
                 Footprint::Uniform => AxisWeight::default(),
                 Footprint::Room => AxisWeight::room(nx - center_x, half_x),
-                Footprint::Edge => AxisWeight::edge(nx - edge_x, side.map(|s| (nx - s).abs())),
+                Footprint::Edge => {
+                    AxisWeight::edge(nx - edge_x, side.map(|s| (nx - s).abs()), edge_geometry)
+                }
             }
         })
         .collect();
@@ -648,7 +664,9 @@ fn build_zone_weights(
             match footprint {
                 Footprint::Uniform => AxisWeight::default(),
                 Footprint::Room => AxisWeight::room(ny - center_y, half_y),
-                Footprint::Edge => AxisWeight::edge(ny - edge_y, top.then_some(ny.abs())),
+                Footprint::Edge => {
+                    AxisWeight::edge(ny - edge_y, top.then_some(ny.abs()), edge_geometry)
+                }
             }
         })
         .collect();
@@ -672,6 +690,9 @@ pub struct ZoneSampler {
     last_global_color: RgbColor,
     last_sample: Option<Instant>,
     weights: Option<WeightCache>,
+    edge_geometry: EdgeGeometry,
+    /// Per-segment cut threshold for edge-sampled zones; `None` turns the detection off.
+    edge_cut_threshold: Option<f32>,
     #[cfg(test)]
     weight_builds: u32,
 }
@@ -679,9 +700,25 @@ pub struct ZoneSampler {
 impl ZoneSampler {
     pub fn set_depth_influence(&mut self, influence: f32) {
         for zone in &mut self.zones {
-            zone.set_depth_influence(influence);
+            zone.set_footprint(influence, self.edge_geometry);
         }
         self.weights = None;
+    }
+
+    /// Resizes the edge bands and drops the weights: the next frame rebuilds them.
+    pub fn set_edge_geometry(&mut self, edge: EdgeGeometry) {
+        if edge == self.edge_geometry {
+            return;
+        }
+        self.edge_geometry = edge;
+        for zone in &mut self.zones {
+            zone.set_edge_geometry(edge);
+        }
+        self.weights = None;
+    }
+
+    pub fn set_edge_cut_threshold(&mut self, threshold: Option<f32>) {
+        self.edge_cut_threshold = threshold;
     }
 
     pub fn new(
@@ -709,6 +746,8 @@ impl ZoneSampler {
             last_global_color: RgbColor::new(0, 0, 0),
             last_sample: None,
             weights: None,
+            edge_geometry: EdgeGeometry::default(),
+            edge_cut_threshold: None,
             #[cfg(test)]
             weight_builds: 0,
         }
@@ -1007,7 +1046,7 @@ impl ZoneSampler {
                 zones: self
                     .zones
                     .iter()
-                    .map(|zone| build_zone_weights(zone, width, height, active))
+                    .map(|zone| build_zone_weights(zone, width, height, active, self.edge_geometry))
                     .collect(),
             });
             #[cfg(test)]
@@ -1064,14 +1103,20 @@ impl ZoneSampler {
             } else {
                 self.processor.clone()
             };
-            let smoothed = processor.process(
-                mean_color,
-                highlight,
-                max_luma,
-                current,
-                is_scene_cut,
-                elapsed,
-            );
+            // A gap this large means the light lags far behind the picture: the segment jumps
+            // like a scene cut. Once the gap is below the threshold, the normal ramp gives a
+            // soft landing. Only gradient-strip segments read one edge; other zones keep the
+            // global cut alone.
+            let zone_cut = is_scene_cut
+                || self.edge_cut_threshold.is_some_and(|threshold| {
+                    zone.uses_edge_sampling()
+                        && processor
+                            .blend_target(mean_color, highlight, max_luma)
+                            .delta(current)
+                            > threshold
+                });
+            let smoothed =
+                processor.process(mean_color, highlight, max_luma, current, zone_cut, elapsed);
             self.smoothed_colors[i] = smoothed;
         }
 

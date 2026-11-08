@@ -318,6 +318,14 @@
           />
 
           <SettingToggle
+            title="Fast edge changes"
+            description="A large colour change on one edge jumps at once instead of ramping."
+            checked={settings?.edge_cut_detection ?? false}
+            disabled={!settings || model.busy}
+            onchange={(checked) => model.patch({ edge_cut_detection: checked })}
+          />
+
+          <SettingToggle
             title="Letterbox compensation"
             description="Sample active video inside black bars."
             checked={settings?.letterbox_detection ?? false}

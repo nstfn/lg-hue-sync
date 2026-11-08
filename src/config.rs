@@ -122,12 +122,16 @@ impl LightZone {
     }
 
     pub fn set_depth_influence(&mut self, influence: f32) {
+        self.set_footprint(influence, EdgeGeometry::default());
+    }
+
+    /// Sampling rectangle from the room depth influence, or from the edge geometry for an
+    /// edge-sampled segment.
+    pub fn set_footprint(&mut self, influence: f32, edge: EdgeGeometry) {
         let Some(pos) = self.hue_channel_position else {
             return; // Legacy/manual rectangles have no recoverable room-depth coordinate.
         };
-        if let Some(point) = self.edge_point() {
-            // The edge band has a fixed size: room depth does not move a strip behind the TV.
-            [self.x_min, self.x_max, self.y_min, self.y_max] = edge_band(point);
+        if self.set_edge_geometry(edge) {
             return;
         }
         let (x, y) = screen_point(pos);
@@ -141,18 +145,80 @@ impl LightZone {
         self.y_min = (y - span * 0.5).clamp(0.0, 1.0);
         self.y_max = (y + span * 0.5).clamp(0.0, 1.0);
     }
+
+    /// Resizes the band of an edge-sampled segment; returns false for any other zone.
+    pub(crate) fn set_edge_geometry(&mut self, edge: EdgeGeometry) -> bool {
+        let Some(point) = self.edge_point() else {
+            return false;
+        };
+        // Room depth does not move a strip behind the TV: only the edge geometry sizes the band.
+        [self.x_min, self.x_max, self.y_min, self.y_max] = edge_band(point, edge);
+        true
+    }
 }
 
 pub fn default_depth_influence() -> f32 {
     0.5
 }
 
-/// Gaussian sigma along the picture edge, as a fraction of the active side. About a tenth
+/// Default Gaussian sigma along the picture edge, as a fraction of the active side. About a tenth
 /// of the side keeps neighbouring segments distinct, yet their bands still overlap.
 pub(crate) const EDGE_SIGMA_ALONG: f32 = 0.08;
-/// Inward decay length, as a fraction of the active side: weight exp(-d / depth). The light
+/// Default inward decay length, as a fraction of the active side: weight exp(-d / depth). The light
 /// follows the outermost content, and a centred subject past 3 depths (18 %) weighs nothing.
 pub(crate) const EDGE_DEPTH: f32 = 0.06;
+pub fn default_edge_sigma_along() -> f32 {
+    EDGE_SIGMA_ALONG
+}
+
+pub fn default_edge_depth() -> f32 {
+    EDGE_DEPTH
+}
+
+pub fn default_edge_cut_threshold() -> f32 {
+    0.35
+}
+
+/// Valid ranges, shared by the live-settings check and the clamp of a hand-edited config.
+pub const EDGE_SIGMA_ALONG_RANGE: (f32, f32) = (0.03, 0.12);
+pub const EDGE_DEPTH_RANGE: (f32, f32) = (0.03, 0.10);
+pub const EDGE_CUT_THRESHOLD_RANGE: (f32, f32) = (0.1, 1.0);
+
+/// Shape of the edge band that a gradient-strip segment reads, as fractions of the active side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeGeometry {
+    /// Gaussian sigma along the picture edge.
+    pub sigma_along: f32,
+    /// Inward decay length: weight exp(-d / depth), 0 past 3 depths.
+    pub depth: f32,
+}
+
+impl EdgeGeometry {
+    /// Clamps to the valid ranges; a non-finite value falls back to the default.
+    pub fn new(sigma_along: f32, depth: f32) -> Self {
+        let bounded = |value: f32, (min, max): (f32, f32), default: f32| {
+            if value.is_finite() {
+                value.clamp(min, max)
+            } else {
+                default
+            }
+        };
+        Self {
+            sigma_along: bounded(sigma_along, EDGE_SIGMA_ALONG_RANGE, EDGE_SIGMA_ALONG),
+            depth: bounded(depth, EDGE_DEPTH_RANGE, EDGE_DEPTH),
+        }
+    }
+}
+
+impl Default for EdgeGeometry {
+    fn default() -> Self {
+        Self {
+            sigma_along: EDGE_SIGMA_ALONG,
+            depth: EDGE_DEPTH,
+        }
+    }
+}
+
 /// Distance under which an edge point counts as lying on an edge.
 const EDGE_EPSILON: f32 = 1e-4;
 
@@ -196,9 +262,9 @@ pub(crate) fn edge_sides(point: (f32, f32)) -> (Option<f32>, bool) {
 
 /// Bounding rectangle [x_min, x_max, y_min, y_max] of an edge band: 3 sigma along the edge
 /// on each side of the point, 3 depths inward. A corner point takes the union of both bands.
-pub(crate) fn edge_band(point: (f32, f32)) -> [f32; 4] {
-    let along = 3.0 * EDGE_SIGMA_ALONG;
-    let deep = 3.0 * EDGE_DEPTH;
+pub(crate) fn edge_band(point: (f32, f32), edge: EdgeGeometry) -> [f32; 4] {
+    let along = 3.0 * edge.sigma_along;
+    let deep = 3.0 * edge.depth;
     let (side, top) = edge_sides(point);
     let mut band = [
         f32::INFINITY,
@@ -393,6 +459,18 @@ pub struct Config {
     /// Hue sampling-footprint expansion; independent of colour presets and neighbour blending.
     #[serde(default = "default_depth_influence")]
     pub depth_influence: f32,
+    /// Gradient-strip edge band: Gaussian sigma along the picture edge.
+    #[serde(default = "default_edge_sigma_along")]
+    pub edge_sigma_along: f32,
+    /// Gradient-strip edge band: inward decay length.
+    #[serde(default = "default_edge_depth")]
+    pub edge_depth: f32,
+    /// Let one gradient-strip segment jump like a scene cut when its colour gap is large.
+    #[serde(default)]
+    pub edge_cut_detection: bool,
+    /// Normalised RGB distance above which a segment jumps, when edge cut detection is on.
+    #[serde(default = "default_edge_cut_threshold")]
+    pub edge_cut_threshold: f32,
     #[serde(default = "default_gamma")]
     pub gamma: f32,
     #[serde(default = "default_noise_gate")]
@@ -542,6 +620,10 @@ fn default_zones() -> Vec<LightZone> {
 }
 
 impl Config {
+    pub fn edge_geometry(&self) -> EdgeGeometry {
+        EdgeGeometry::new(self.edge_sigma_along, self.edge_depth)
+    }
+
     pub fn apply_hue_pairing(&mut self, bridge_ip: String, paired: crate::hue::PairedBridge) {
         self.bridge_ip = bridge_ip;
         self.username = paired.username;
@@ -627,6 +709,10 @@ impl Config {
             peak_weight: 0.15,
             spatial_blend: 0.15,
             depth_influence: default_depth_influence(),
+            edge_sigma_along: default_edge_sigma_along(),
+            edge_depth: default_edge_depth(),
+            edge_cut_detection: false,
+            edge_cut_threshold: default_edge_cut_threshold(),
             gamma: default_gamma(),
             noise_gate_threshold: 0.02,
             smoothing_factor: 0.35,
@@ -1446,7 +1532,7 @@ mod tests {
         assert_eq!(bottom.edge_point(), Some((0.0, 1.0)));
         assert_eq!(bottom.y_max, 1.0);
         // A top corner takes the union of its top and side bands.
-        let corner = edge_band((0.0, 0.0));
+        let corner = edge_band((0.0, 0.0), EdgeGeometry::default());
         for (actual, expected) in corner.into_iter().zip([0.0, 0.24, 0.0, 0.24]) {
             assert!((actual - expected).abs() < 1e-6, "{corner:?}");
         }

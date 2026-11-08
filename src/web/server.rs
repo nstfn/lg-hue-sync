@@ -69,6 +69,22 @@ pub struct LiveSettings {
     #[serde(default = "crate::config::default_depth_influence")]
     #[schema(minimum = 0, maximum = 1, default = 0.5)]
     pub depth_influence: f32,
+    /// Gradient-strip edge band: Gaussian sigma along the picture edge.
+    #[serde(default = "crate::config::default_edge_sigma_along")]
+    #[schema(minimum = 0.03, maximum = 0.12, default = 0.08)]
+    pub edge_sigma_along: f32,
+    /// Gradient-strip edge band: inward decay length.
+    #[serde(default = "crate::config::default_edge_depth")]
+    #[schema(minimum = 0.03, maximum = 0.1, default = 0.06)]
+    pub edge_depth: f32,
+    /// A large colour change on one gradient-strip segment jumps instead of ramping.
+    #[serde(default)]
+    #[schema(default = false)]
+    pub edge_cut_detection: bool,
+    /// Normalised RGB distance above which a segment jumps.
+    #[serde(default = "crate::config::default_edge_cut_threshold")]
+    #[schema(minimum = 0.1, maximum = 1, default = 0.35)]
+    pub edge_cut_threshold: f32,
     #[schema(minimum = 0.5, maximum = 2)]
     pub gamma: f32,
     #[schema(minimum = 0, maximum = 0.06)]
@@ -121,6 +137,7 @@ fn default_smoothing_factor() -> f32 {
 
 impl LiveSettings {
     fn validate(&self) -> Result<(), ApiError> {
+        use crate::config::{EDGE_CUT_THRESHOLD_RANGE, EDGE_DEPTH_RANGE, EDGE_SIGMA_ALONG_RANGE};
         let ranges = [
             (
                 "brightness_multiplier",
@@ -144,6 +161,24 @@ impl LiveSettings {
             ("peak_weight", self.peak_weight, 0.0, 1.0),
             ("spatial_blend", self.spatial_blend, 0.0, 0.5),
             ("depth_influence", self.depth_influence, 0.0, 1.0),
+            (
+                "edge_sigma_along",
+                self.edge_sigma_along,
+                EDGE_SIGMA_ALONG_RANGE.0,
+                EDGE_SIGMA_ALONG_RANGE.1,
+            ),
+            (
+                "edge_depth",
+                self.edge_depth,
+                EDGE_DEPTH_RANGE.0,
+                EDGE_DEPTH_RANGE.1,
+            ),
+            (
+                "edge_cut_threshold",
+                self.edge_cut_threshold,
+                EDGE_CUT_THRESHOLD_RANGE.0,
+                EDGE_CUT_THRESHOLD_RANGE.1,
+            ),
             ("gamma", self.gamma, 0.5, 2.0),
             ("noise_gate_threshold", self.noise_gate_threshold, 0.0, 0.06),
             ("smoothing_factor", self.smoothing_factor, 0.05, 1.0),
@@ -1875,6 +1910,10 @@ mod tests {
             peak_weight: 0.35,
             spatial_blend: 0.0,
             depth_influence: crate::config::default_depth_influence(),
+            edge_sigma_along: crate::config::default_edge_sigma_along(),
+            edge_depth: crate::config::default_edge_depth(),
+            edge_cut_detection: false,
+            edge_cut_threshold: crate::config::default_edge_cut_threshold(),
             gamma: 1.0,
             noise_gate_threshold: 0.02,
             smoothing_factor: 0.35,

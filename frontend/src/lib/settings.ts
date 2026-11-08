@@ -6,6 +6,10 @@ export interface LiveSettings {
   peak_weight: number;
   spatial_blend: number;
   depth_influence: number;
+  edge_sigma_along: number;
+  edge_depth: number;
+  edge_cut_detection: boolean;
+  edge_cut_threshold: number;
   gamma: number;
   noise_gate_threshold: number;
   smoothing_factor: number;
@@ -35,6 +39,10 @@ export const initialSettings: LiveSettings = {
   peak_weight: 0.15,
   spatial_blend: 0.15,
   depth_influence: 0.5,
+  edge_sigma_along: 0.08,
+  edge_depth: 0.06,
+  edge_cut_detection: false,
+  edge_cut_threshold: 0.35,
   gamma: 1,
   noise_gate_threshold: 0.02,
   smoothing_factor: 0.35,
@@ -66,7 +74,9 @@ export type NumericKey =
   | 'max_color_step'
   | 'noise_gate_threshold'
   | 'hue_output_brightness'
-  | 'nanoleaf_output_brightness';
+  | 'nanoleaf_output_brightness'
+  | 'edge_sigma_along'
+  | 'edge_depth';
 export const faders: {
   key: NumericKey;
   label: string;
@@ -129,6 +139,20 @@ export const faders: {
     stops: [0, 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.06],
     format: (v) => `${Number((v * 100).toFixed(1))}%`,
     help: 'Treats very dark screen regions as black. Strict black turns those lights fully off.',
+  },
+  {
+    key: 'edge_sigma_along',
+    label: 'Edge width',
+    stops: [0.03, 0.04, 0.05, 0.06, 0.08, 0.1, 0.12],
+    format: (v) => `${Math.round(v * 100)}%`,
+    help: 'Spread of each segment along the picture edge. Lower is more precise but leaves gaps between segments.',
+  },
+  {
+    key: 'edge_depth',
+    label: 'Edge depth',
+    stops: [0.03, 0.04, 0.05, 0.06, 0.08, 0.1],
+    format: (v) => `${Math.round(v * 100)}%`,
+    help: 'How far into the picture each segment reads. Lower follows the outermost content.',
   },
 ];
 export const colourModes = [

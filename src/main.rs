@@ -156,6 +156,12 @@ fn reconnect_hue(config: &mut Config) -> Result<ConnectedHue> {
     })
 }
 
+/// Per-segment cut threshold for the gradient strip, or `None` when the detection is off.
+fn edge_cut_threshold(enabled: bool, threshold: f32) -> Option<f32> {
+    let (min, max) = config::EDGE_CUT_THRESHOLD_RANGE;
+    enabled.then(|| threshold.clamp(min, max))
+}
+
 fn hue_configuration_id(config: &Config) -> Option<String> {
     config
         .entertainment_configuration_id
@@ -608,8 +614,9 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
     let mut second_pass_at: Option<tokio::time::Instant> = None;
     let mut hue_application_id: Option<String> = None;
 
+    let edge_geometry = config.edge_geometry();
     for zone in &mut config.zones {
-        zone.set_depth_influence(config.depth_influence);
+        zone.set_footprint(config.depth_influence, edge_geometry);
     }
     let mut hue_sampler = if hue_active {
         Some(ZoneSampler::new(
@@ -631,6 +638,11 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         sampler.set_spatial_blend(config.spatial_blend);
         sampler.set_gamma(config.gamma);
         sampler.set_max_color_step(config.max_color_step);
+        sampler.set_edge_geometry(edge_geometry);
+        sampler.set_edge_cut_threshold(edge_cut_threshold(
+            config.edge_cut_detection,
+            config.edge_cut_threshold,
+        ));
     }
 
     let mut hue_packet_builder = if hue_active {
@@ -746,6 +758,13 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
         peak_weight: config.peak_weight,
         spatial_blend: config.spatial_blend,
         depth_influence: config.depth_influence,
+        edge_sigma_along: edge_geometry.sigma_along,
+        edge_depth: edge_geometry.depth,
+        edge_cut_detection: config.edge_cut_detection,
+        edge_cut_threshold: config.edge_cut_threshold.clamp(
+            config::EDGE_CUT_THRESHOLD_RANGE.0,
+            config::EDGE_CUT_THRESHOLD_RANGE.1,
+        ),
         gamma: config.gamma,
         noise_gate_threshold: config.noise_gate_threshold,
         smoothing_factor: config.smoothing_factor,
@@ -1262,8 +1281,11 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
             current_hue_brightness = live_st.brightness_multiplier * live_st.hue_output_brightness;
             current_use_xy = live_st.use_xy_gamut;
             config.depth_influence = live_st.depth_influence;
+            config.edge_sigma_along = live_st.edge_sigma_along;
+            config.edge_depth = live_st.edge_depth;
+            let edge_geometry = config.edge_geometry();
             for zone in &mut config.zones {
-                zone.set_depth_influence(live_st.depth_influence);
+                zone.set_footprint(live_st.depth_influence, edge_geometry);
             }
             *shared_state.hue_zones.write().unwrap() = config.zones.clone();
             if hue_sync_enabled != live_st.hue_sync_enabled {
@@ -1332,7 +1354,12 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 s.set_saturation_boost(live_st.saturation_boost);
                 s.set_peak_weight(live_st.peak_weight);
                 s.set_spatial_blend(live_st.spatial_blend);
+                s.set_edge_geometry(edge_geometry);
                 s.set_depth_influence(live_st.depth_influence);
+                s.set_edge_cut_threshold(edge_cut_threshold(
+                    live_st.edge_cut_detection,
+                    live_st.edge_cut_threshold,
+                ));
                 s.set_gamma(live_st.gamma);
                 s.set_noise_gate_threshold(live_st.noise_gate_threshold);
                 s.set_max_color_step(live_st.max_color_step);
@@ -1380,6 +1407,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                 save_cfg.peak_weight = live_st.peak_weight;
                 save_cfg.spatial_blend = live_st.spatial_blend;
                 save_cfg.depth_influence = live_st.depth_influence;
+                save_cfg.edge_sigma_along = live_st.edge_sigma_along;
+                save_cfg.edge_depth = live_st.edge_depth;
+                save_cfg.edge_cut_detection = live_st.edge_cut_detection;
+                save_cfg.edge_cut_threshold = live_st.edge_cut_threshold;
                 save_cfg.gamma = live_st.gamma;
                 save_cfg.noise_gate_threshold = live_st.noise_gate_threshold;
                 save_cfg.smoothing_factor = live_st.smoothing_factor;
@@ -1465,8 +1496,10 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                     config.hue_bridge_certificate_sha256 = Some(area.certificate_sha256);
                     let live_st = shared_state.current_settings.read().unwrap().clone();
                     config.zones = area.zones;
+                    let edge_geometry =
+                        config::EdgeGeometry::new(live_st.edge_sigma_along, live_st.edge_depth);
                     for zone in &mut config.zones {
-                        zone.set_depth_influence(live_st.depth_influence);
+                        zone.set_footprint(live_st.depth_influence, edge_geometry);
                     }
                     *shared_state.hue_zones.write().unwrap() = config.zones.clone();
                     hue_sampler = Some(ZoneSampler::new(
@@ -1491,6 +1524,11 @@ async fn run_daemon(config_path: PathBuf) -> Result<()> {
                         sampler.set_spatial_blend(live_st.spatial_blend);
                         sampler.set_gamma(live_st.gamma);
                         sampler.set_max_color_step(live_st.max_color_step);
+                        sampler.set_edge_geometry(edge_geometry);
+                        sampler.set_edge_cut_threshold(edge_cut_threshold(
+                            live_st.edge_cut_detection,
+                            live_st.edge_cut_threshold,
+                        ));
                     }
                     if configuration_changed {
                         hue_status.request(None);
